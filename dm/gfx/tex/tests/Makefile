@@ -6,11 +6,11 @@ t_fmt_mtl: t_fmt_mtl.m ../nvn_fmt_mtl.c ../nvn_fmt_mtl.h
 	clang $(CFLAGS) -fobjc-arc -o $@ t_fmt_mtl.m ../nvn_fmt_mtl.c -framework Metal -framework Foundation
 t_bc2astc: t_bc2astc.c ../nvn_bc2astc.c ../nvn_bc2astc.h ../bc2astc_core.h ../../../third_party/bcdec/bcdec.h
 	clang $(CFLAGS) -o $@ t_bc2astc.c ../nvn_bc2astc.c -lm
-bench_bc2astc_dread: bench_bc2astc_dread.c ../nvn_bc2astc.c ../nvn_bc2astc.h ../bc2astc_core.h ../bc2astc_body.inc ../nvn_deswizzle.c ../../nvn/nvn_tex.c
+bench_bc2astc_dread: bench_bc2astc_dread.c ../nvn_texkey.h ../nvn_bc2astc.c ../nvn_bc2astc.h ../bc2astc_core.h ../bc2astc_body.inc ../nvn_deswizzle.c ../../nvn/nvn_tex.c
 	clang $(CFLAGS) -Wno-unused -o $@ bench_bc2astc_dread.c ../nvn_bc2astc.c ../nvn_deswizzle.c ../../nvn/nvn_tex.c -lz -lm
-# Real-data benchmark (Dread-specific, game data stays outside the repository): make bench ROMFS=<extracted RomFS> ASTCENC=<astcenc> OUT=<report folder>
+# Real-data benchmark (Dread-specific, game data stays outside the repository): make bench ROMFS=<extracted RomFS> ASTCENC=<astcenc> OUT=<report folder> [KEEP='<keep table.tsv> 27']
 bench: bench_bc2astc_dread
-	mkdir -p $(OUT) && ./bench_bc2astc_dread $(ROMFS) $(ASTCENC) $(OUT)
+	mkdir -p $(OUT) && ./bench_bc2astc_dread $(ROMFS) $(ASTCENC) $(OUT) $(KEEP)
 run: t_tex t_fmt_mtl
 	./t_fmt_mtl && ./t_tex
 # Needs the astcenc binary (ARM-software/astc-encoder): make ASTCENC=/path/to/astcenc astc
