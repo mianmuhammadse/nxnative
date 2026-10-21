@@ -1,0 +1,2 @@
+# bc3_keep_rgba8 v1: BC3 textures kept RGBA8 on GPUs without BC (alpha PSNR after the ASTC transcode below 27.0 dB); written by bench_bc2astc_dread
+# key (nvn_texkey, hex)	nvn format	width	height	alpha PSNR	name
