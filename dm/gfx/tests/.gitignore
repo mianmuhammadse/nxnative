@@ -7,6 +7,8 @@ t_nvn.dSYM/
 t_builtin
 t_deswz_gpu
 t_deswz_gpu.dSYM/
+t_bc2astc_gpu
+t_bc2astc_gpu.dSYM/
 t_builtin.dSYM/
 t_pace
 t_timestamp
