@@ -1694,16 +1694,19 @@ static int pkg_edges_clean(NvPkg *pk, const tex_t *t) {   // the covered pages w
 static int no_bc(void) {
     static int v = -1;
     if (v < 0) { const char *e = getenv("DM_TEST_NO_BC"); v = (e && *e && strcmp(e, "0")) || ![g_dev supportsBCTextureCompression];
-        if (v) MLOG("the GPU has no BC compressed formats%s: BC textures are created decompressed (BC1–5 decompressed on the GPU, BC6H / BC7 / 3D on the CPU)", e && *e && strcmp(e, "0") ? " (test switch DM_TEST_NO_BC)" : ""); }
+        if (v) MLOG("the GPU has no BC compressed formats%s: BC textures are stored as ASTC 4x4 (BC1–3) or decompressed (see the DM_NO_BC_ASTC line)", e && *e && strcmp(e, "0") ? " (test switch DM_TEST_NO_BC)" : ""); }
     return v;
 }
 static int bc_unpack(uint32_t nvn_fmt, uint32_t *pf, int *bpp) { return no_bc() && nvn_bc_unpacked(nvn_fmt, pf, bpp); }
 // No BC: BC1, BC2 and BC3 are stored as ASTC 4x4 (8 bits per texel, a quarter of RGBA8) by transcoding every BC block into one ASTC block at upload (nvn_bc2astc.h, bc2astc_core.h; GPU kernel `bca`). BC4 / BC5 / BC6H / BC7 and 3D textures stay decompressed.
 // DM_NO_BC_ASTC=all (default) | bc1 (BC1 only) | 0 (everything decompressed to RGBA8, the A/B reference). BC3 alpha carries real data in some games and ASTC keeps four alpha levels per block (about 30 dB), so a game profile can list
 // the packaged BC3 textures that stay RGBA8 (dm/games/<id>/bc3_keep_rgba8.tsv, written by tests/bench_bc2astc_dread.c, keyed by nvn_texkey of their storage); DM_NO_BC_ASTC_KEEP=0 ignores the list (A/B)
+static int keep_on(void);
 static int astc_mode(void) {
     static int v = -1;
-    if (v < 0) { const char *e = getenv("DM_NO_BC_ASTC"); v = !e || !*e || !strcmp(e, "all") ? 2 : (!strcmp(e, "bc1") ? 1 : (!strcmp(e, "0") ? 0 : 2)); }
+    if (v < 0) { const char *e = getenv("DM_NO_BC_ASTC"); v = !e || !*e || !strcmp(e, "all") ? 2 : (!strcmp(e, "bc1") ? 1 : (!strcmp(e, "0") ? 0 : 2));
+        MLOG("no BC: DM_NO_BC_ASTC=%s: %s%s", e && *e ? e : "(unset) all", v == 2 ? "BC1, BC2 and BC3 are stored as ASTC 4x4 (8 bits per texel), BC4 / BC5 / BC6H / BC7 and 3D textures decompressed" : v == 1 ? "BC1 is stored as ASTC 4x4, every other BC format decompressed" : "every BC format is decompressed to RGBA8 / R8 / RG8 / RGBA16F",
+             v && !keep_on() ? " (DM_NO_BC_ASTC_KEEP=0: the BC3 keep table is ignored)" : ""); }
     return v;
 }
 static uint64_t *g_keep_keys; static size_t g_keep_n;   // sorted keys of the BC3 keep table
@@ -1739,7 +1742,6 @@ static int bc_astc(const tex_t *t, uint32_t *pf) {
         }
         if (dec == 2) return 0;
     }
-    static int said; if (!said++) MLOG("no BC: BC%s stored as ASTC 4x4 (8 bits per texel; DM_NO_BC_ASTC=0 decompresses to RGBA8, bc1 limits it to BC1)", mode == 1 ? "1" : "1–3");
     *pf = apf; return 1;
 }
 static int mtl_fmt_block_bc(MTLPixelFormat f) { return f >= MTLPixelFormatBC1_RGBA && f <= MTLPixelFormatBC7_RGBAUnorm_sRGB; }   // a real BC format (not the decompressed or ASTC stand-in)
