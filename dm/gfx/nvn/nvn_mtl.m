@@ -1906,6 +1906,7 @@ static up_dec *g_up_decs; static int g_nup_decs, g_up_deccap;
 // buffer→texture copies (up_blit) put those into the ASTC texture, since a compute kernel cannot write an ASTC texture. Offsets in the parameter cell are relative to the start of the staging block
 typedef struct { __unsafe_unretained id<MTLBuffer> src, params; size_t poff; uint32_t nbx, nby; } up_ast;
 static up_ast *g_up_asts; static int g_nup_asts, g_up_astcap;
+static uint64_t g_up_ebar;   // intra-encoder barriers up_flush has encoded (tests/t_up_order.m checks the order of the batch by them)
 static id<MTLComputePipelineState> bca_pso(void) {
     static id<MTLComputePipelineState> ps; static int failed;
     if (!ps && !failed) { NSError *e = nil; id<MTLLibrary> lib = [g_dev newLibraryWithSource:@(nvn_bca_msl) options:nil error:&e]; id<MTLFunction> fn = lib ? [lib newFunctionWithName:@"bca"] : nil;
@@ -1984,7 +1985,7 @@ static void up_flush(void) {
     }
     // The barriers between these steps are inside one encoder, so they are encoder-stage barriers (a queue barrier orders against earlier encoders, not against the commands before it in this one: the copies of
     // transcoded blocks started before the kernel had written them and the textures read as all-zero ASTC blocks, the error colour)
-    if (b && nfill && (g_nup_decs || g_nup_asts || nfill < g_nup_blits)) [b barrierAfterEncoderStages:MTLStageBlit beforeEncoderStages:MTLStageDispatch | MTLStageBlit visibilityOptions:MTL4VisibilityOptionDevice];
+    if (b && nfill && (g_nup_decs || g_nup_asts || nfill < g_nup_blits)) { [b barrierAfterEncoderStages:MTLStageBlit beforeEncoderStages:MTLStageDispatch | MTLStageBlit visibilityOptions:MTL4VisibilityOptionDevice]; g_up_ebar++; }
     if (b && g_nup_decs) {   // GPU decompression without BC (see up_dec): offsets in the parameter block are relative to the start of the staging block
         [b setArgumentTable:g_up_ct]; [b setComputePipelineState:bcd_pso()];
         for (int i = 0; i < g_nup_decs; i++) { up_dec *x = &g_up_decs[i];
@@ -1997,7 +1998,7 @@ static void up_flush(void) {
             [g_up_ct setAddress:x->src.gpuAddress atIndex:0]; [g_up_ct setAddress:x->params.gpuAddress + x->poff atIndex:1]; [g_up_ct setAddress:x->src.gpuAddress atIndex:2];
             [b dispatchThreadgroups:MTLSizeMake((x->nbx + 7) / 8, (x->nby + 7) / 8, 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)]; }
     }
-    if (b && (g_nup_decs || g_nup_asts)) [b barrierAfterEncoderStages:MTLStageDispatch beforeEncoderStages:MTLStageBlit visibilityOptions:MTL4VisibilityOptionDevice];
+    if (b && (g_nup_decs || g_nup_asts)) { [b barrierAfterEncoderStages:MTLStageDispatch beforeEncoderStages:MTLStageBlit visibilityOptions:MTL4VisibilityOptionDevice]; g_up_ebar++; }
     for (int i = 0; b && i < g_nup_blits; i++) {
         up_blit *x = &g_up_blits[i]; if (x->fill) continue;
         enc_b_copy_buffer_texture(b, x->src, x->off, x->row, x->image, x->size, x->dst, x->slice, x->level, MTLOriginMake(0, 0, 0));

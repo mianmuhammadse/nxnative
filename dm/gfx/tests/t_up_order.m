@@ -3,6 +3,8 @@
 //   A  content copy queued, then zero fill, same batch  → the content
 //   B  zero fill alone                                  → the constant (0,0,0,0) ASTC block (an all-zero block would be invalid)
 //   C  a large `bca` transcoding job + the copy of its output, then zero fill, same batch → the transcoded blocks (kernel finished before the copy starts, copy after the fill)
+// Besides the data, the test counts the intra-encoder barriers up_flush encodes (g_up_ebar) and asserts the exact number: A 1, B 0, C 2. Whether an unordered copy overtakes its kernel depends on what else the GPU runs
+// (an idle GPU often runs them in order anyway, and the bug seen in Metroid Dread needed a busy one), so the data check alone cannot be trusted to fail without the barriers.
 // Usage: t_up_order
 #include "../nvn/nvn_mtl.m"
 int prog_key(const prog_t *p, unsigned stage, uint8_t key[8]) { (void)p; (void)stage; memset(key, 0, 8); return 0; }
@@ -12,7 +14,7 @@ module_t g_mod[MAX_MOD]; int g_nmod;
 void svc_thread_dump(void) {}
 uint64_t now_ns(void) { return bp_now(); }
 
-// symbols of hle_nvn.c, which this test does not link: no sparse pools, every address readable
+// symbols of hle_nvn.c, which this test does not link: no sparse pools, every address readable, descriptor pools at ID 0
 int nvn_host_readable(uint64_t a, uint64_t n) { (void)a; (void)n; return 1; }
 uint64_t nvn_new_serial(void) { static uint64_t n = 90000; return ++n; }
 int nvn_sparse_pool(const void *pool) { (void)pool; return 0; }
@@ -21,6 +23,7 @@ uint64_t nvn_sparse_copy(const void *pool, void *dst, uint64_t a, uint64_t n) { 
 int nvn_sparse_since(const void *pool, uint64_t a, uint64_t n, uint64_t gen, uint64_t stamp) { (void)pool; (void)a; (void)n; (void)gen; (void)stamp; return 0; }
 void nvn_sparse_protect(const void *pool, uint64_t a, uint64_t n) { (void)pool; (void)a; (void)n; }
 int nvn_sparse_mapped(const void *pool, uint64_t a, uint64_t n) { (void)pool; (void)a; (void)n; return 1; }
+int nvn_dpool_base(const void *pool, int tex) { (void)pool; (void)tex; return 0; }
 
 static int failed;
 #define CHECK(c, ...) do { if (!(c)) { failed++; printf("  ✗ "); printf(__VA_ARGS__); printf("\n"); } } while (0)
@@ -55,13 +58,15 @@ int main(void) {
         id<MTLBuffer> src = [g_dev newBufferWithBytes:want length:64 options:MTLResourceStorageModeShared]; res_add(src);
         up_begin(); up_blit_add(src, 0, 32, 64, MTLSizeMake(8, 8, 1), t, 0, 0); [g_up_texs addObject:t];
         tex_zero_fill(t, 1);   // queues the fill (the host has a command buffer open, so this does not flush by itself)
-        up_flush(); wait_uploads();
+        uint64_t eb0 = g_up_ebar; up_flush(); wait_uploads();
+        CHECK(g_up_ebar - eb0 == 1, "A: %llu intra-encoder barriers, expected 1 (zero fill, barrier, content copy)", (unsigned long long)(g_up_ebar - eb0));
         uint8_t got[64]; read_back(t, got);
         CHECK(!memcmp(got, want, 64), "A: texture zeroed after the content was queued does not hold the content");
     }
     {   // B: zero fill alone
         id<MTLTexture> t = new_astc();
-        tex_zero_fill(t, 1); up_flush(); wait_uploads();
+        tex_zero_fill(t, 1); uint64_t eb0 = g_up_ebar; up_flush(); wait_uploads();
+        CHECK(g_up_ebar == eb0, "B: a lone zero fill needs no barrier, %llu encoded", (unsigned long long)(g_up_ebar - eb0));
         uint8_t got[64]; read_back(t, got);
         int ok = 1; for (int b = 0; b < 4; b++) ok &= !memcmp(got + b * 16, zero, 16);
         CHECK(ok, "B: zero fill does not leave the constant ASTC block");
@@ -81,7 +86,8 @@ int main(void) {
         g_up_asts[g_nup_asts++] = (up_ast){stg, q, qoff, NB, NB};
         up_blit_add(stg, BYTES, NB * 16, BYTES, MTLSizeMake(NB * 4, NB * 4, 1), t, 0, 0); [g_up_texs addObject:t];
         tex_zero_fill(t, 1);
-        up_flush(); wait_uploads();
+        uint64_t eb0 = g_up_ebar; up_flush(); wait_uploads();
+        CHECK(g_up_ebar - eb0 == 2, "C: %llu intra-encoder barriers, expected 2 (zero fill → kernel, kernel → copy); a queue barrier does not order commands inside one encoder", (unsigned long long)(g_up_ebar - eb0));
         id<MTLBuffer> dst = [g_dev newBufferWithLength:BYTES options:MTLResourceStorageModeShared]; res_add(dst);
         id read = blit();
         [read copyFromTexture:t sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(NB * 4, NB * 4, 1) toBuffer:dst destinationOffset:0 destinationBytesPerRow:NB * 16 destinationBytesPerImage:BYTES];
