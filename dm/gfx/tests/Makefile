@@ -223,7 +223,9 @@ t_vk_desc: t_vk_desc.m ../vk/hle_vk.m $(MTL_T_DEP)
 	clang $(CFLAGS) -I../../third_party/vulkan-headers/include -fobjc-arc -o $@ t_vk_desc.m $(MTL_T_SRC) ../nvn/nvn_mtl.m $(FW)
 t_up_order: t_up_order.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_up_order.m $(MTL_T_SRC) $(FW)
-run: t_nvn t_dirty_slots t_dirty_race t_tex_layout t_builtin t_vin t_tbuf2d t_deswz_gpu t_bc2astc_gpu t_up_order t_pace t_timestamp t_fstep t_refl t_hmap t_cover t_fuse_check t_present_crop t_reorder_chain t_defer_chain t_zskip t_xv t_ub t_vbuf t_geometry t_mip_extent t_rt_range_shape t_rt_range_ro t_rt_range t_rt_depth_ro t_pso_skey t_pso_archive t_pso_bundle t_pull t_pull_inv t_pso_pending t_pfv t_view_levels t_view_swizzle t_vk_desc t_integer_blend t_primitive_restart t_clear_ds t_depth16_clear t_upgrade_alias t_stencil_view
+t_astc_hw: t_astc_hw.m ../tex/nvn_bc2astc.c ../tex/nvn_bc2astc.h ../tex/bc2astc_core.h ../tex/bc2astc_body.inc
+	clang $(CFLAGS) -fobjc-arc -o $@ t_astc_hw.m ../tex/nvn_bc2astc.c -framework Metal -framework Foundation
+run: t_nvn t_dirty_slots t_dirty_race t_tex_layout t_builtin t_vin t_tbuf2d t_deswz_gpu t_bc2astc_gpu t_astc_hw t_up_order t_pace t_timestamp t_fstep t_refl t_hmap t_cover t_fuse_check t_present_crop t_reorder_chain t_defer_chain t_zskip t_xv t_ub t_vbuf t_geometry t_mip_extent t_rt_range_shape t_rt_range_ro t_rt_range t_rt_depth_ro t_pso_skey t_pso_archive t_pso_bundle t_pull t_pull_inv t_pso_pending t_pfv t_view_levels t_view_swizzle t_vk_desc t_integer_blend t_primitive_restart t_clear_ds t_depth16_clear t_upgrade_alias t_stencil_view
 	./t_nvn
 	./t_dirty_slots
 	./t_dirty_race
@@ -277,5 +279,6 @@ run: t_nvn t_dirty_slots t_dirty_race t_tex_layout t_builtin t_vin t_tbuf2d t_de
 	MTL_DEBUG_LAYER=1 ./t_upgrade_alias
 	MTL_DEBUG_LAYER=1 ./t_stencil_view
 	MTL_DEBUG_LAYER=1 ./t_up_order
+	./t_astc_hw
 	DM_GAME=$(GAME) python3 test_tbdr_budget.py
 .PHONY: run
