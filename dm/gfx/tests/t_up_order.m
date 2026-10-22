@@ -24,6 +24,7 @@ int nvn_sparse_since(const void *pool, uint64_t a, uint64_t n, uint64_t gen, uin
 void nvn_sparse_protect(const void *pool, uint64_t a, uint64_t n) { (void)pool; (void)a; (void)n; }
 int nvn_sparse_mapped(const void *pool, uint64_t a, uint64_t n) { (void)pool; (void)a; (void)n; return 1; }
 int nvn_dpool_base(const void *pool, int tex) { (void)pool; (void)tex; return 0; }
+int nvn_flushed(const void *p, uint64_t n) { (void)p; (void)n; return 0; }
 
 static int failed;
 #define CHECK(c, ...) do { if (!(c)) { failed++; printf("  ✗ "); printf(__VA_ARGS__); printf("\n"); } } while (0)
