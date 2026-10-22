@@ -1145,14 +1145,30 @@ def toolchain():   # the compilers' versions, part of the shader stages' keys
     return ('cmd', ['xcodebuild', '-version']), ('cmd', ['spirv-cross', '--revision'])
 
 
+def chain_tables(py, repo, sh, env, logs, g, chain):
+    """c1_full.tsv and cb_extent.tsv carry the chain version they were made for in their first line ("# chain b-<V>"); the host ignores a table of another version ("[RED] c1_full.tsv is stale or missing",
+    "cb_extent.tsv is stale or missing": every c1 gets its own 64 KiB, uniform reads reach the whole binding: Breath of the Wild lost memory to both). The version includes dmsh_chain.lock, which holds the fingerprints
+    of the tools of the machine that last updated it (spirv-cross, the Metal compiler), so on a Mac whose tools differ every committed table is stale although nothing in the game changed. Made again here from this
+    build's libraries (c1_guard.py, cb_extent.py, as the chain procedure in AGENTS.md does) in the profile's folder, as a provisional or derived build always does; a no-op when both tables already match"""
+    want = f'# chain b-{chain}'
+    tables = [g.table('c1_full.tsv'), g.table('cb_extent.tsv')]
+    if all(t.exists() and t.read_text(errors='replace').split('\n', 1)[0].startswith(want) for t in tables): return
+    libs = sh / 'cache' / f'b-{chain}'
+    if not libs.is_dir(): say(f'[RED] c1_full.tsv / cb_extent.tsv are not stamped for chain version {chain} and there is no {libs} to make them from: the app will log them as stale'); return
+    PROG.set(step='c1 guard')
+    run([py, repo / 'dm/gfx/tools/c1_guard.py', libs, tables[0]], logs / 'c1_guard.log', env=env)   # shaders whose c1 reads are not proven bounded
+    PROG.set(step='uniform read extents')
+    run([py, repo / 'dm/gfx/tools/cb_extent.py', libs, tables[1]], logs / 'cb_extent.log', env=env)   # how far each shader reads into its uniform blocks
+    say(f'c1_full.tsv and cb_extent.tsv of game profile {g.id} were made for another chain version than {chain} (this Mac\'s tools differ from dmsh_chain.lock\'s): made again in {g.dir}')
+
+
 def build_shaders(py, repo, sh, xlate, env, logs, g, provisional=False, pkg_key=None):
     """The iOS shader libraries (dmsh_build.py). Reused when the shader package (pkg_key, its content; None never reuses) and the chain's tools, translator binaries, profile and compilers
     are as at the last successful build: dmsh_build.py would only restore every shader from its cache (63,000 for Breath of the Wild: about 100 s)"""
     ios, log = sh / 'ios', logs / 'dmsh_build.log'
     PROG.stage('iOS shaders')
-    if provisional:
-        PROG.set(step='chain header')
-        run([py, repo / 'dm/gfx/tools/dmsh_chain.py', '--header'], logs / 'dmsh_chain.log', env=env)   # the profile's chain version header (dmsh_build checks it)
+    PROG.set(step='chain header')
+    run([py, repo / 'dm/gfx/tools/dmsh_chain.py', '--header'], logs / 'dmsh_chain.log', env=env)   # the profile's chain version header (dmsh_build checks it); a registered profile's changes only on a machine whose tools differ from dmsh_chain.lock's (see chain_tables)
     chain = re.search(r'#define DMSH_CHAIN "(.*)"', g.table('dmsh_chain.h').read_text()).group(1)
     libs = ios / f'b-{chain}'; kf = libs.with_name(libs.name + '.key')
     if pkg_key:
@@ -1160,7 +1176,7 @@ def build_shaders(py, repo, sh, xlate, env, logs, g, provisional=False, pkg_key=
         key = fingerprint(pkg_key, ('files', chain_files(repo)), ('stat', xlate.parent), ('files', profile_files(g)), *toolchain(), str(xlate),
                           {k: env.get(k) for k in ('XLATE_DEBUG', 'XLATE_REDUCED')}, env=env)
         if next(libs.glob('*_b.metallib'), None) and (note := reused(kf, key)) is not None:
-            PROG.end(f'{note}, reused (inputs unchanged)'); return ios
+            PROG.end(f'{note}, reused (inputs unchanged)'); chain_tables(py, repo, sh, env, logs, g, chain); return ios
     else: key = None
     rmtree(kf)
     try: PROG.watch(ShaderWatch(g, ios, Path(env['WORK'])))
@@ -1185,6 +1201,7 @@ def build_shaders(py, repo, sh, xlate, env, logs, g, provisional=False, pkg_key=
         PROG.end(f'{ok:,} of {total:,} shaders ready' + (f' ({int(c.group(1)):,} from the cache)' if c else '') + failed)
     else: PROG.end()
     if key: kf.write_text(f'{key}\n{note}\n')
+    chain_tables(py, repo, sh, env, logs, g, chain)
     return ios
 
 
