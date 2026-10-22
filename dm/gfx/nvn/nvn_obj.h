@@ -206,6 +206,8 @@ uint64_t mtl_drawable_ns_take(void);   // Take and zero: cumulative ns spent wai
 void mtl_bw(uint64_t *load, uint64_t *store, uint64_t *full_rw_passes);   // Cumulative attachment load / store bytes, cumulative number of full load-store passes
 uint64_t mtl_udc_saved_bytes(void);                                      // Write-back bytes actually saved by DM_NVN_UNWRITTEN_DC
 int mtl_has_window(void);
+void mtl_fps_set(int v);                                   // frame-rate override: 0 = auto, 30 / 60 = pinned (the in-game Auto / 30 switch, front_ios.m); any thread
+int mtl_fps_user(void);                                    // the override now (0 / 30 / 60)
 int mtl_fps_target(void);                                   // target frame rate 30 / 60 (power-saving mode, DM_FPS, the game itself asking for 30)
 int mtl_warm_wait(int timeout_ms);
 int mtl_link_active(void);

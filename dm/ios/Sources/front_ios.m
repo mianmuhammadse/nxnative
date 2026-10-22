@@ -9,6 +9,7 @@
 #include "hle.h"
 #include "dm.h"
 #include "haptics_apple.h"
+#include "game_profile.h"
 
 UIView *dm_gamepad_view(CGRect frame);
 void dm_gamepad_reset(void);
@@ -19,7 +20,6 @@ bool dm_show_launcher(void *view_controller, void (*done)(void));   // Launcher.
 static CAMetalLayer *g_layer;
 static void front_ios_power_watch(void);
 static void front_ios_audio_watch(void);
-static UILabel *front_ios_fps_label(void);
 
 @interface DmGameView : UIView
 @end
@@ -41,10 +41,42 @@ static UILabel *front_ios_fps_label(void);
 }
 @end
 
+uint64_t mtl_present_count(void);
+void mtl_fps_set(int v);
+int mtl_fps_user(void);
+static NSString *const k_fps_lock_key = @"DmFpsLock";
+static int front_ios_fps_switch(void) { const char *e = getenv("DM_FPS_SWITCH"); return e ? atoi(e) != 0 : DM_GAME_FPS_SWITCH; }
+
+@interface DmFpsLabel : UILabel
+@property (nonatomic) BOOL counter, button;
+@property (nonatomic) double last;   // the last counter reading, -1 = none yet
+- (CGSize)preferredSize;
+- (void)showFps:(double)fps;
+@end
+@implementation DmFpsLabel
+- (CGSize)preferredSize { return CGSizeMake(self.counter && self.button ? 112 : 64, self.button ? 28 : 22); }
+- (BOOL)pointInside:(CGPoint)p withEvent:(UIEvent *)e { (void)e; return CGRectContainsPoint(CGRectInset(self.bounds, -8, -8), p); }   // the label is small: a fingertip is not
+- (void)showFps:(double)fps {   // -1: no reading (yet); -2: keep the last one
+    if (fps == -2) fps = self.last; else self.last = fps;
+    int forced = mtl_fps_user() == 30;
+    NSString *mode = forced ? @"30 fps" : @"Auto", *n = fps < 0 ? @"--" : [NSString stringWithFormat:@"%.0f", fps];
+    self.text = self.button ? (self.counter ? [NSString stringWithFormat:@"%@ fps · %@", n, forced ? @"30" : @"Auto"] : mode) : [NSString stringWithFormat:@"%@ fps", n];
+    if (self.button) { self.backgroundColor = [UIColor colorWithWhite:1 alpha:forced ? 0.45 : 0.14]; self.textColor = forced ? [UIColor colorWithWhite:0 alpha:0.7] : [UIColor colorWithWhite:1 alpha:0.6]; }
+}
+- (void)tapped {
+    int v = mtl_fps_user() == 30 ? 0 : 30;
+    mtl_fps_set(v);
+    [NSUserDefaults.standardUserDefaults setObject:@(v) forKey:k_fps_lock_key];
+    [self showFps:-2];
+}
+@end
+
+static DmFpsLabel *front_ios_fps_label(void);
+
 @interface DmRootVC : UIViewController
 @property (nonatomic, strong) DmGameView *game;
 @property (nonatomic, strong) UIView *pad;
-@property (nonatomic, strong) UILabel *fps;
+@property (nonatomic, strong) DmFpsLabel *fps;
 @property (nonatomic) BOOL launched;
 - (void)startGame;
 @end
@@ -90,7 +122,7 @@ static void launcher_done(void) { [g_root startGame]; }
     self.game.frame = CGRectMake(floor((b.size.width - w) / 2), floor((b.size.height - h) / 2), w, h);
     if (self.fps) {   // the top row's free stretch: right of DmGamepad.m's L3 key (102 + 17 of its units from the safe edge), level with − / + (22 units down); u is its unit
         CGRect s = UIEdgeInsetsInsetRect(b, self.view.safeAreaInsets); CGFloat u = MIN(b.size.height / 430.0, 1.3);
-        self.fps.frame = CGRectMake(floor(CGRectGetMinX(s) + 130 * u), floor(CGRectGetMinY(s) + 22 * u - 11), 64, 22);
+        CGSize z = [self.fps preferredSize]; self.fps.frame = CGRectMake(floor(CGRectGetMinX(s) + 130 * u), floor(CGRectGetMinY(s) + 22 * u - z.height / 2), z.width, z.height);
     }
 }
 - (void)viewDidAppear:(BOOL)a {
@@ -123,22 +155,35 @@ static void front_ios_power_watch(void) {
 }
 
 // Frame-rate counter: the frames put on screen in the last second (nvn_mtl.m counts them for NVN and for the Vulkan layer alike; frames the display link merged away are not counted).
-// On when the IPA was built with it (the NSP script's SHOW_FPS / --show-fps → DMShowFPS in Info.plist); DM_SHOW_FPS=0 / 1 in Documents/env.txt overrides that without a rebuild. NULL when off
-uint64_t mtl_present_count(void);
-static UILabel *front_ios_fps_label(void) {
+// On when the IPA was built with it (the NSP script's SHOW_FPS / --show-fps → DMShowFPS in Info.plist); DM_SHOW_FPS=0 / 1 in Documents/env.txt overrides that without a rebuild. NULL when both the counter and the switch are off
+//
+// Auto / 30 fps switch (the game profile's fps_switch, DM_FPS_SWITCH=0 / 1 in env.txt): the same label becomes a button, drawn like DmGamepad.m's 2D / 3D one, and a tap toggles Auto ↔ 30 (mtl_fps_set: the display link and the presents follow within a frame).
+// It sits outside the pad view, so it works with a controller connected (the pad hides) and shows with the counter off. The choice is kept in NSUserDefaults (DmFpsLock: 0 = Auto, 30), and replaces DM_FPS from env.txt at launch.
+// Only for a game whose logic steps by the time that passed: a game that counts frames runs in slow motion at 30
+static DmFpsLabel *front_ios_fps_label(void) {
     const char *e = getenv("DM_SHOW_FPS");
-    if (!(e ? atoi(e) != 0 : [[NSBundle.mainBundle objectForInfoDictionaryKey:@"DMShowFPS"] boolValue])) return nil;
-    UILabel *l = [UILabel new];
+    BOOL counter = e ? atoi(e) != 0 : [[NSBundle.mainBundle objectForInfoDictionaryKey:@"DMShowFPS"] boolValue], button = front_ios_fps_switch() != 0;
+    if (!counter && !button) return nil;
+    DmFpsLabel *l = [DmFpsLabel new]; l.counter = counter; l.button = button;
     l.font = [UIFont monospacedDigitSystemFontOfSize:13 weight:UIFontWeightSemibold]; l.textColor = UIColor.whiteColor; l.textAlignment = NSTextAlignmentCenter;
-    l.backgroundColor = [UIColor colorWithWhite:0 alpha:0.45]; l.layer.cornerRadius = 6; l.layer.masksToBounds = YES; l.userInteractionEnabled = NO;
-    l.text = @"-- fps";
-    __block uint64_t n0 = mtl_present_count(); __block double t0 = CACurrentMediaTime();
-    [NSTimer scheduledTimerWithTimeInterval:1.0 repeats:YES block:^(NSTimer *t) {
-        (void)t; uint64_t n = mtl_present_count(); double now = CACurrentMediaTime();
-        if (now - t0 < 1.5) l.text = [NSString stringWithFormat:@"%.0f fps", (n - n0) / (now - t0)];   // a longer span is the time in the background: no reading
-        n0 = n; t0 = now;
-    }];
-    LOG("front end: frame-rate counter on");
+    l.backgroundColor = [UIColor colorWithWhite:0 alpha:0.45]; l.layer.cornerRadius = button ? 14 : 6; l.layer.masksToBounds = YES; l.userInteractionEnabled = NO;
+    if (button) {
+        NSNumber *saved = [NSUserDefaults.standardUserDefaults objectForKey:k_fps_lock_key];
+        if (saved) mtl_fps_set(saved.intValue == 30 ? 30 : 0);
+        l.layer.borderWidth = 1.5; l.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.38].CGColor; l.userInteractionEnabled = YES;
+        [l addGestureRecognizer:[[UITapGestureRecognizer alloc] initWithTarget:l action:@selector(tapped)]];
+        LOG("front end: Auto / 30 fps switch on (%s)", mtl_fps_user() == 30 ? "30 fps" : "Auto");
+    }
+    [l showFps:-1];
+    if (counter) {
+        __block uint64_t n0 = mtl_present_count(); __block double t0 = CACurrentMediaTime();
+        [NSTimer scheduledTimerWithTimeInterval:1.0 repeats:YES block:^(NSTimer *t) {
+            (void)t; uint64_t n = mtl_present_count(); double now = CACurrentMediaTime();
+            if (now - t0 < 1.5) [l showFps:(n - n0) / (now - t0)];   // a longer span is the time in the background: no reading
+            n0 = n; t0 = now;
+        }];
+        LOG("front end: frame-rate counter on");
+    }
     return l;
 }
 

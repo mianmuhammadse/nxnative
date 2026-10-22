@@ -190,7 +190,8 @@ Comparison and testing:
 | `DM_TEST_NO_BC=1` | Forces the path for "the GPU does not support BC compressed textures" on any machine: BC1–3 stored as ASTC 4x4, the other BC formats decompressed |
 | `DM_NO_BC_ASTC=all\|bc1\|0` | Without BC: which BC formats are stored as ASTC 4x4 (default `all` = BC1, BC2, BC3; `bc1` = BC1 only; `0` = decompress everything to RGBA8). See [tex/README.md](tex/README.md) |
 | `DM_NO_BC_ASTC_KEEP=0`, `DM_NO_BC_ASTC_KEEP_TABLE=path`, `DM_NO_BC_ASTC_KEYLOG=1` | Without BC: ignore the profile's `bc3_keep_rgba8.tsv`, use another table, log every packaged BC3 lookup (key, format, size, hit) |
-| `DM_FPS=30` or `60` | Pins the target frame rate |
+| `DM_FPS=30` or `60` | Pins the target frame rate at start. On iOS the in-game Auto / 30 fps switch (profile key `fps_switch`, or `DM_FPS_SWITCH=1`; `mtl_fps_set`) replaces it at any time, and the choice saved in `NSUserDefaults` (`DmFpsLock`) replaces it at launch; each change logs `frame rate switch: Auto → 30 fps` |
+| `DM_FPS_SCHEDULE=frame:fps,...` | Calls the same switch at game frame numbers (fps 0 = Auto, 30, 60), for Mac runs: `DM_FPS_SCHEDULE=3000:30,6000:0` |
 | `DM_NVN_BARRIER=game`, `DM_NVN_CUT` | Pass ordering and segment commits: see [docs/agents/04-graphics.md](../../docs/agents/04-graphics.md) section 7 |
 | `DM_PRESENT_HZ=N` | The frequency of presentation pacing (default 60); 0 means no frame limit and is for performance profiling only |
 | `DM_PRESENT_UPSCALE=metalfx` or `off` | How the present scales a picture smaller than its rectangle on the screen: `metalfx` through MetalFX's spatial scaler, `off` (the default) bilinearly. An option on both platforms (the iOS launcher's Upscaling; `env.txt` on the Mac); rendering at the screen's resolution stays the reference for sharpness ([reference](../../docs/reference/rendering.md#the-present-upscales-through-metalfx)) |
