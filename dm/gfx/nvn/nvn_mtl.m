@@ -1,5 +1,6 @@
 // Metal execution layer of the NVN null device, see nvn_mtl.h.
 #import <Metal/Metal.h>
+#import <objc/runtime.h>
 #import <QuartzCore/CAMetalLayer.h>
 #import <QuartzCore/CAMetalDisplayLink.h>
 #import <MetalFX/MetalFX.h>
@@ -1745,6 +1746,7 @@ static int bc_astc(const tex_t *t, uint32_t *pf) {
     *pf = apf; return 1;
 }
 static int mtl_fmt_block_bc(MTLPixelFormat f) { return f >= MTLPixelFormatBC1_RGBA && f <= MTLPixelFormatBC7_RGBAUnorm_sRGB; }   // a real BC format (not the decompressed or ASTC stand-in)
+static void tex_tag_format(id<MTLTexture> mt, uint32_t nvn_fmt);   // memory by texture format, below
 static int is_astc4(MTLPixelFormat f) { return f == MTLPixelFormatASTC_4x4_LDR || f == MTLPixelFormatASTC_4x4_sRGB; }
 static MTLTextureDescriptor *tex_desc(const tex_t *t, int packaged) {
     uint32_t pf = 0; uint8_t swz[4];
@@ -2189,6 +2191,7 @@ static id<MTLTexture> pkg_upload_(const tex_t *t, uint64_t *stamp, id<MTLTexture
     id<MTLTexture> mt = reuse && reuse.pixelFormat == d.pixelFormat && reuse.width == d.width && reuse.height == d.height && reuse.mipmapLevelCount == d.mipmapLevelCount && reuse.textureType == d.textureType
                         ? reuse : [g_dev newTextureWithDescriptor:d];
     if (!mt) { RED_ONCE(2, "failed to create MTLTexture %ux%u format %#x target %d", t->d.width, t->d.height, t->d.format, t->d.target); return nil; }
+    tex_tag_format(mt, t->d.format);
     if (g_allocprof > 0) { static int n; if (n++ < 30 || n % 500 == 0) MLOG("new texture (%s) #%d ser=%llu %ux%ux%u format %#x target %d levels %u storage %p", __func__, n, (unsigned long long)t->serial, t->d.width, t->d.height, t->d.depth, t->d.format, t->d.target, t->d.levels, (void *)t->mem); }
     res_add(mt);   // Both first upload and re-upload register residency here (Metal 4 does not make resources resident automatically; a missed registration = GPU address page fault)
     int sparse = t->pool && nvn_sparse_pool(t->pool);
@@ -2597,6 +2600,7 @@ static id<MTLTexture> tex_mtl_(const tex_t *ct) {
         if (!d) return nil;
         mt = [g_dev newTextureWithDescriptor:d];
         if (!mt) { RED_ONCE(2, "failed to create MTLTexture %ux%u format %#x target %d", t->d.width, t->d.height, t->d.format, t->d.target); return nil; }
+        tex_tag_format(mt, t->d.format);
         res_add(mt); if (!tex_init_fill(t, mt)) { uint32_t apf; tex_zero_fill(mt, bc_astc(t, &apf)); }   // register residency before filling (the copy destination must be resident too)
     }
     if (g_allocprof > 0) { static int n; if (n++ < 30 || n % 500 == 0) MLOG("new texture (%s) #%d ser=%llu %ux%ux%u format %#x target %d levels %u storage %p", __func__, n, (unsigned long long)t->serial, t->d.width, t->d.height, t->d.depth, t->d.format, t->d.target, t->d.levels, (void *)t->mem); }
@@ -2609,6 +2613,45 @@ static id<MTLTexture> tex_mtl_(const tex_t *ct) {
     pthread_mutex_unlock(&g_smu);
     tex_put(t->serial, mt);
     return mt;
+}
+// Live textures by NVN source format and what they are stored as (the memory line's second line): the NVN format is attached to each MTLTexture the host creates for a game texture (tex_tag_format), the stored format is the Metal one.
+// Source classes: BC1 (0x41 / 0x42 / 0x45 / 0x46), BC2, BC3, BC4, BC5, BC7, BC6H, other formats; stored: native BC, ASTC 4x4 (BC1-3 on a GPU without BC), decompressed (R8 / RG8 / RGBA8 / RGBA16F), or the format itself. Textures made elsewhere (sparse, packaged) are not counted
+static const void *const k_tex_fmt_key = &k_tex_fmt_key;
+static void tex_tag_format(id<MTLTexture> mt, uint32_t nvn_fmt) { objc_setAssociatedObject(mt, k_tex_fmt_key, @(nvn_fmt), OBJC_ASSOCIATION_RETAIN_NONATOMIC); }
+static int tex_src_class(uint32_t f) {   // 0 non-BC, 1 BC1, 2 BC2, 3 BC3, 4 BC4, 5 BC5, 6 BC6H, 7 BC7
+    switch (f) { case 0x41: case 0x42: case 0x45: case 0x46: return 1; case 0x43: case 0x47: return 2; case 0x44: case 0x48: return 3; case 0x49: case 0x4a: return 4; case 0x4b: case 0x4c: return 5;
+                 case 0x4f: case 0x50: return 6; case 0x4d: case 0x4e: return 7; default: return 0; }
+}
+static void tex_format_stat(void) {
+    static const char *const src[] = {"non-BC", "BC1", "BC2", "BC3", "BC4", "BC5", "BC6H", "BC7"}, *const dst[] = {"as is", "native BC", "ASTC", "decompressed"};
+    uint64_t n[8][4] = {{0}}, b[8][4] = {{0}}, total = 0, untagged = 0;
+    @autoreleasepool {
+        CFMutableSetRef seen = CFSetCreateMutable(NULL, 0, NULL);
+        pthread_mutex_lock(&g_smu);
+        void **const tabs[2] = {g_alias.vals, g_by_serial.vals}; const uint32_t caps[2] = {g_alias.cap, g_by_serial.cap};
+        for (int ti = 0; ti < 2; ti++) for (uint32_t i = 0; i < caps[ti]; i++) {
+            void *v = tabs[ti][i];
+            if (!v || CFSetContainsValue(seen, v)) continue;
+            CFSetAddValue(seen, v);
+            id o = (__bridge id)v; id<MTLTexture> tl[2] = {nil, nil};
+            if ([o isKindOfClass:NvPkg.class]) { NvPkg *pk = o; tl[0] = pk->tex; tl[1] = pk->spare; }   // packaged textures: the live one and the spare kept for the next re-upload
+            else if ([o conformsToProtocol:@protocol(MTLTexture)]) tl[0] = o;
+            for (int k = 0; k < 2; k++) {
+                id<MTLTexture> mt = tl[k]; if (!mt || CFSetContainsValue(seen, (__bridge const void *)mt)) continue;
+                CFSetAddValue(seen, (__bridge const void *)mt);
+                uint64_t sz = mt.allocatedSize; total += sz;
+                NSNumber *f = objc_getAssociatedObject(mt, k_tex_fmt_key);
+                if (!f) { untagged += sz; continue; }
+                int c = tex_src_class(f.unsignedIntValue), st = !c ? 0 : mtl_fmt_block_bc(mt.pixelFormat) ? 1 : is_astc4(mt.pixelFormat) ? 2 : 3;
+                n[c][st]++; b[c][st] += sz;
+            }
+        }
+        pthread_mutex_unlock(&g_smu); CFRelease(seen);
+    }
+    char line[640]; int o = snprintf(line, sizeof line, "live textures %llu MB:", (unsigned long long)(total >> 20));
+    for (int c = 0; c < 8; c++) for (int st = 0; st < 4; st++) if (n[c][st]) o += snprintf(line + o, sizeof line - o, " %s %s %llu tex %.1f MB;", src[c], dst[st], (unsigned long long)n[c][st], b[c][st] / 1048576.0);
+    snprintf(line + o, sizeof line - o, " untagged %.1f MB", untagged / 1048576.0);
+    MLOG("memory by texture format: %s", line);
 }
 // Memory readout line (always on, low frequency, capped): resident memory, GPU allocated, deferred-release queue, residency set object count, registered memory pools / peak / tracking table capacity, cumulative texture re-uploads.
 // Purpose: pin down "crashes with no log". The system gives no notice before killing a process for memory, so only readouts left beforehand can show which number kept climbing.
@@ -2637,6 +2680,7 @@ void mtl_mem_stat(unsigned long long frame, unsigned long long rss_mb) {
     snprintf(avail, sizeof avail, "%llu MB", (unsigned long long)(os_proc_available_memory() >> 20));
 #endif
     MLOG("memory up to frame %llu: resident %llu MB, GPU allocated %llu MB, deferred-release queue %lu, residency set %lu, serial objects %u, memory pools %d (resident %d; peak %d / tracking table capacity %d; freed but alive %lu, %llu MB), shared textures %u (%u of them unreferenced; evicted with pools %llu, on storage takeover %llu in total), texture re-uploads %llu in total, per-frame arena blocks created %llu in total, finalized textures still referenced %u (small table, %llu put in total); headroom to the system memory limit %s", frame, rss_mb, gpu, nd, nr, ns, live, pres, peak, cap, dead_n, dead_mb, ashared, aorph, (unsigned long long)g_alias_evicted, (unsigned long long)g_alias_taken, (unsigned long long)g_pkg_reuploads, (unsigned long long)g_arena_made, nghost, (unsigned long long)ghost_puts, avail);
+    tex_format_stat();
     { void mtl_vc_stats(unsigned *, uint64_t *, uint64_t *), mtl_tb2_stats(uint64_t *, uint64_t *, uint64_t *); uint64_t mtl_tex_mis_count(void); unsigned vn; uint64_t vh, vm, tb, tm, tf;
       mtl_vc_stats(&vn, &vh, &vm); mtl_tb2_stats(&tb, &tm, &tf);
       MLOG("texture views by texture (vc_get): %u textures hold cached views; %llu views reused, %llu made in total; texture buffers bound as 2D rows for wrapped 1D fetches %llu times, %llu made, %llu failed "
