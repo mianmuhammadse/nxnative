@@ -17,6 +17,7 @@
 #include <TargetConditionals.h>
 #if TARGET_OS_IPHONE
 #include <os/proc.h>   // os_proc_available_memory: for the memory readout line
+#include <malloc/malloc.h>
 #endif
 #include "nvn_mtl.h"
 #include "nvn_obj.h"
@@ -716,7 +717,9 @@ static void *g_sub_pool;
 static int tbdr_on(void);
 
 static uint64_t g_sub_serial;   // Submission index (used by the parallel precompile's 'predict only once per submission')
+static void mem_trim_if_requested(void);   // memory-pressure response, below
 void mtl_sub_begin(void) {
+    mem_trim_if_requested();
     mtl_init(); g_sub_serial++; g_seg = 0; seg_clk_put(g_sclk); g_sclk = NULL; g_rc_npend = 0; g_rc_skip = 0;
     defer_drain();
     defer_reset();
@@ -1630,11 +1633,13 @@ static void serial_del(uint64_t k) { pthread_mutex_lock(&g_smu); id old = hm_get
 enum { NGHOST = 512 };
 static nvn_hmap g_tex_live = {.klen = 8};   // serial → (void *)1, under g_smu
 static nvn_hmap g_ghost = {.klen = 8}; static uint64_t g_ghost_ring[NGHOST]; static unsigned g_ghost_next; static uint64_t g_ghost_puts;
+static unsigned g_ghost_old, g_ghost_limit = NGHOST;   // g_ghost_old: ring index (counted like g_ghost_next) of the oldest slot that may hold an entry; g_ghost_limit: how many entries the table keeps (NGHOST; lower while memory is short, mem_pressure_tick)
 void mtl_tex_init(const tex_t *t) { if (!t->serial) return; pthread_mutex_lock(&g_smu); nvn_hm_put(&g_tex_live, &t->serial, (void *)1); pthread_mutex_unlock(&g_smu); }
 static void obj_drop(id o) { if (alias_has(o)) defer_obj_unref(o); else defer_obj_release(o); }   // caller holds g_smu
 static __unsafe_unretained id tex_get(uint64_t k) {
     pthread_mutex_lock(&g_smu); __unsafe_unretained id o = hm_get_id(&g_by_serial, &k); if (!o && g_ghost.n) o = hm_get_id(&g_ghost, &k); pthread_mutex_unlock(&g_smu); return o;
 }
+static unsigned ghost_enforce(uint64_t *bytes);
 static void tex_put(uint64_t k, id o) {   // serials from 2^62 up are external textures (mtl_ext_tex), never initialized by the game
     pthread_mutex_lock(&g_smu);
     nvn_hmap *m = k >= (1ull << 62) || nvn_hm_get(&g_tex_live, &k) ? &g_by_serial : &g_ghost;
@@ -1646,6 +1651,7 @@ static void tex_put(uint64_t k, id o) {   // serials from 2^62 up are external t
         *slot = k; g_ghost_puts++;
     }
     hm_put_id(m, &k, o); g_ser_gen++;
+    if (m == &g_ghost && g_ghost_limit < NGHOST) ghost_enforce(NULL);
     pthread_mutex_unlock(&g_smu);
 }
 // Host record of a packaged texture: the current MTLTexture, the upload stamp, and the global write generation at the last check
@@ -1657,6 +1663,18 @@ static void tex_put(uint64_t k, id o) {   // serials from 2^62 up are external t
 @implementation NvPkg
 - (void)dealloc { res_remove(tex); if (spare) res_remove(spare); free(edge[0]); free(edge[1]); }
 @end
+static NSHashTable *g_ghost_dropped;   // the ghost entries a trim dropped (weak), to count how many are still alive after it
+static unsigned g_ghost_bufbacked;   // dropped ghost entries that were textures over a pool buffer (no memory of their own), for the trim's log line
+static unsigned ghost_enforce(uint64_t *bytes) {   // caller holds g_smu: drop the oldest entries until the table holds at most g_ghost_limit; returns how many, and the GPU bytes of those that own memory in *bytes
+    unsigned dropped = 0, bufbacked = 0; if (g_ghost_next - g_ghost_old > NGHOST) g_ghost_old = g_ghost_next - NGHOST;
+    while (g_ghost.n > g_ghost_limit && g_ghost_old != g_ghost_next) {
+        uint64_t *slot = &g_ghost_ring[g_ghost_old++ % NGHOST]; if (!*slot) continue;
+        id ev = hm_get_id(&g_ghost, slot);
+        if (ev) { if (bytes) { id<MTLTexture> gt = [ev conformsToProtocol:@protocol(MTLTexture)] ? ev : [ev isKindOfClass:NvPkg.class] ? ((NvPkg *)ev)->tex : nil; if (gt && !gt.buffer) *bytes += gt.allocatedSize; else if (gt) bufbacked++; } if (g_ghost_dropped) [g_ghost_dropped addObject:ev]; obj_drop(ev); }
+        hm_del_id(&g_ghost, slot); *slot = 0; dropped++;
+    }
+    g_ghost_bufbacked = bufbacked; return dropped;
+}
 static uint64_t g_pkg_uploads, g_pkg_reuploads, g_pkg_miss, g_pkg_edge_skips;
 static uint64_t g_pfv_upgrades;
 // DM_NVN_DIRTYCHECK=1 (diagnostic, compared against ground truth): fully hash the pool content on every use; changed but not detected by dirty-page tracking = a missed detection
@@ -9649,6 +9667,92 @@ static void clear_ds_tri(const p_clear_ds *c) {
        (unsigned long)sc.x, (unsigned long)sc.y, (unsigned long)sc.width, (unsigned long)sc.height);
 }
 
+// ---- Memory-pressure response (iOS kills an app at its footprint limit, 3.07 GB on an iPhone 15, usually without a warning the app can act on) ----
+// Triggers, which only set a request: the system's memory-pressure source (warn / critical), UIApplicationDidReceiveMemoryWarning (front_ios.m, mtl_mem_pressure_request), and a watermark on os_proc_available_memory()
+// sampled every 30 frames by the present thread (mtl_mem_pressure_tick). The request is carried out at the next submission's start (mtl_sub_begin, the submit thread: nothing is encoded, and the tables below are only
+// written there). Tier 1 (headroom under 300 MB): the ghost table of finalized transient render targets (BotW fills its 512 entries) is cut to 64 entries, spare textures of re-uploaded packaged textures are dropped, the GPU is
+// waited for once so swapped-out staging blocks and the deferred releases go, the view cache is emptied, malloc returns its free pages. The shared textures nothing resolves to any more go too (idle for 64 submissions; 16 in tier 2, which also drops the staging slots' own blocks). Measured on the Mac (BotW, shrine, frame 6,000): the 448 dropped ghost entries are freed (14 stay alive), but Metal's allocated size does not move for them, and the whole trim returned about 10 MB; the response is a safety
+// valve, not a fix for the creep. Normally nothing runs and the ghost table keeps its full size; while short of memory it is held at 64 (until headroom is back above 600 MB).
+// Test switches (Mac): DM_MEM_TRIM=<frame>:<tier>[,...] requests tiers at frames, DM_MEM_HEADROOM=<MB> stands in for os_proc_available_memory()
+size_t malloc_zone_pressure_relief(malloc_zone_t *zone, size_t goal);   // the header does not expose it to this file
+static _Atomic int g_mp_req, g_mp_reason;
+static int g_mp_pressured; static uint64_t g_mp_last_frame, g_mp_hold_until; static int g_mp_last_tier; static long g_mp_fake = -2;
+enum { MP_SRC_WARN = 1, MP_SRC_CRIT = 2, MP_UI = 3, MP_WATER = 4, MP_TEST = 5 };
+void mtl_mem_pressure_request(int tier, int reason) { int cur = atomic_load(&g_mp_req); while (tier > cur && !atomic_compare_exchange_weak(&g_mp_req, &cur, tier)) {} atomic_store(&g_mp_reason, reason); }
+static long mp_headroom_mb(void) {   // -1: unknown
+    if (g_mp_fake == -2) { const char *e = getenv("DM_MEM_HEADROOM"); g_mp_fake = e ? atol(e) : -1; }
+    if (g_mp_fake >= 0) return g_mp_fake;
+#if TARGET_OS_IPHONE
+    return (long)(os_proc_available_memory() >> 20);
+#else
+    return -1;
+#endif
+}
+static uint64_t mp_footprint_mb(void) { task_vm_info_data_t vi; mach_msg_type_number_t cnt = TASK_VM_INFO_COUNT; return task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vi, &cnt) == KERN_SUCCESS ? vi.phys_footprint >> 20 : 0; }
+void mtl_mem_pressure_tick(uint64_t frame) {   // the present thread, every frame
+    static dispatch_source_t src; static const char *sched; static int init;
+    if (!init) { init = 1; sched = getenv("DM_MEM_TRIM");
+        src = dispatch_source_create(DISPATCH_SOURCE_TYPE_MEMORYPRESSURE, 0, DISPATCH_MEMORYPRESSURE_WARN | DISPATCH_MEMORYPRESSURE_CRITICAL, dispatch_get_global_queue(QOS_CLASS_UTILITY, 0));
+        if (src) { dispatch_source_set_event_handler(src, ^{ unsigned long m = dispatch_source_get_data(src); mtl_mem_pressure_request(m & DISPATCH_MEMORYPRESSURE_CRITICAL ? 2 : 1, m & DISPATCH_MEMORYPRESSURE_CRITICAL ? MP_SRC_CRIT : MP_SRC_WARN); }); dispatch_resume(src); } }
+    if (sched && *sched) { char *end; unsigned long long at = strtoull(sched, &end, 10); if (*end == ':' && frame >= at) { mtl_mem_pressure_request(atoi(end + 1), MP_TEST); const char *c = strchr(end, ','); sched = c ? c + 1 : ""; } }
+    if (frame % 30) return;
+    long h = mp_headroom_mb();
+    if (h >= 0) {
+        int tier = h < 150 ? 2 : h < 300 ? 1 : 0;
+        if (tier && (tier > g_mp_last_tier || frame - g_mp_last_frame >= 300)) mtl_mem_pressure_request(tier, MP_WATER);
+        if (h < 450) g_mp_hold_until = frame + 900;   // still short: keep the ghost table small
+        if (!tier && g_mp_pressured && h >= 600 && frame >= g_mp_hold_until) { pthread_mutex_lock(&g_smu); g_ghost_limit = NGHOST; pthread_mutex_unlock(&g_smu); g_mp_pressured = 0; g_mp_last_tier = 0; MLOG("memory pressure over: headroom %ld MB, the ghost table is back to %d entries (frame %llu)", h, (int)NGHOST, (unsigned long long)frame); }
+    }
+    if (atomic_load(&g_mp_req)) g_mp_hold_until = frame + 900;
+}
+static void mem_trim_if_requested(void) {
+    int tier = atomic_exchange(&g_mp_req, 0); if (!tier) return;
+    int reason = atomic_load(&g_mp_reason); uint64_t frame = atomic_load(&g_cur_frame);
+    long h0 = mp_headroom_mb(); uint64_t gpu0 = g_dev.currentAllocatedSize >> 20, fp0 = mp_footprint_mb();
+    static const char *const rn[] = {"", "system warning", "system critical", "app memory warning", "headroom watermark", "test switch"};
+    char out[640]; int o = 0;
+    uint64_t gb = 0; unsigned gn = 0, spn = 0, ovn = 0, orn = 0, blk_n = 0; uint64_t spb = 0, orb = 0, blkb = 0;
+    // ghost table to 64
+    g_ghost_dropped = [NSHashTable weakObjectsHashTable];
+    pthread_mutex_lock(&g_smu); unsigned before = g_ghost.n; g_ghost_limit = 64; gn = ghost_enforce(&gb); (void)before;
+    // spare textures of packaged textures
+    for (uint32_t i = 0; i < g_by_serial.cap; i++) { void *v = g_by_serial.vals[i]; if (!v) continue; id ob = (__bridge id)v; if (![ob isKindOfClass:NvPkg.class]) continue; NvPkg *pk = ob;
+        if (pk->spare) { spb += pk->spare.allocatedSize; spn++; id sp = pk->spare; pk->spare = nil; defer_obj_release(sp); } }
+    pthread_mutex_unlock(&g_smu);
+    o += snprintf(out + o, sizeof out - o, "ghost table %u -> %u entries (%u dropped, %llu MB of their own, %u over pool buffers), spare textures %u (%llu MB)", before, before - gn, gn, (unsigned long long)(gb >> 20), g_ghost_bufbacked, spn, (unsigned long long)(spb >> 20));
+    // view cache
+    pthread_mutex_lock(&g_rmu); ovn = g_vc.n; nvn_hm_clear(&g_vc, vc_set_free); pthread_mutex_unlock(&g_rmu);
+    o += snprintf(out + o, sizeof out - o, ", view cache %u entries", ovn);
+    {   // shared textures nothing resolves to any more (the ghost entries just dropped among them: the sharing table holds them as long as it does) and that were not looked up for 64 (tier 1) / 16 (tier 2) submissions
+        pthread_mutex_lock(&g_smu); uint64_t idle = tier >= 2 ? 16 : 64;
+        CFMutableSetRef held = CFSetCreateMutable(NULL, 0, NULL); for (uint32_t i = 0; i < g_by_serial.cap; i++) if (g_by_serial.vals[i]) CFSetAddValue(held, g_by_serial.vals[i]); for (uint32_t i = 0; i < g_ghost.cap; i++) if (g_ghost.vals[i]) CFSetAddValue(held, g_ghost.vals[i]);
+        uint32_t n = 0; alias_key *ks = NULL;
+        for (uint32_t i = 0; i < g_alias.cap; i++) { if (!g_alias.vals[i] || CFSetContainsValue(held, g_alias.vals[i])) continue; alias_key k; memcpy(&k, g_alias.keys + (size_t)i * g_alias.klen, sizeof k);
+            uintptr_t seen = (uintptr_t)nvn_hm_get(&g_alias_seen, &k); if (seen && g_fence + 1 - seen < idle) continue; id ot = (__bridge id)g_alias.vals[i]; if ([ot conformsToProtocol:@protocol(MTLTexture)] && ((id<MTLTexture>)ot).buffer) continue;
+            alias_key *nk = realloc(ks, (n + 1) * sizeof *ks); if (!nk) break; ks = nk; ks[n++] = k; }
+        for (uint32_t j = 0; j < n; j++) { void *old = nvn_hm_del(&g_alias, &ks[j]); if (!old) continue; nvn_hm_del(&g_alias_seen, &ks[j]); id ob = CFBridgingRelease(old); orb += ((id<MTLResource>)ob).allocatedSize; orn++; if (g_alias_set) CFSetRemoveValue(g_alias_set, (__bridge const void *)ob); defer_obj_release(ob); }
+        if (orn) { g_ser_gen++; g_alias_evicted += orn; }
+        CFRelease(held); free(ks); pthread_mutex_unlock(&g_smu);
+        o += snprintf(out + o, sizeof out - o, ", shared textures %u (%llu MB)", orn, (unsigned long long)(orb >> 20));
+    }
+    if (tier >= 2 && !g_up_block) {   // the staging slots' own blocks (made again when the next upload needs one)
+        for (int i = 0; i < 3; i++) if (g_up_slot_blk[i]) { blkb += g_up_slot_blk[i].length; blk_n++; id b = g_up_slot_blk[i]; g_up_slot_blk[i] = nil; defer_obj_release(b); }
+        o += snprintf(out + o, sizeof out - o, ", staging slot blocks %u (%llu MB)", blk_n, (unsigned long long)(blkb >> 20));
+    }
+    // wait for the GPU once so the retired objects (swapped-out staging blocks, the textures above) go now
+    unsigned alive0 = 0; uint64_t ab0 = 0; if (g_up_old) @autoreleasepool { for (id<MTLBuffer> b in g_up_old.allObjects) { alive0++; ab0 += b.length; } }
+    mtl_finish_gpu();
+    pthread_mutex_lock(&g_deferred_mu); for (NvDeferredRelease *d in g_deferred) if (d->fence > g_done) d->fence = g_done; pthread_mutex_unlock(&g_deferred_mu);   // the GPU is idle and nothing is encoded yet: everything retired so far can go now, not after this submission
+    defer_drain();
+    unsigned alive1 = 0; uint64_t ab1 = 0; if (g_up_old) @autoreleasepool { for (id<MTLBuffer> b in g_up_old.allObjects) { alive1++; ab1 += b.length; } }
+    o += snprintf(out + o, sizeof out - o, ", swapped-out staging blocks %u -> %u (%llu -> %llu MB)", alive0, alive1, (unsigned long long)(ab0 >> 20), (unsigned long long)(ab1 >> 20));
+    unsigned ghost_alive = 0; @autoreleasepool { ghost_alive = (unsigned)g_ghost_dropped.allObjects.count; } g_ghost_dropped = nil;
+    o += snprintf(out + o, sizeof out - o, ", %u of the dropped ghost entries still alive", ghost_alive);
+    malloc_zone_pressure_relief(NULL, 0);
+    g_mp_pressured = 1; g_mp_last_tier = tier; g_mp_last_frame = frame;
+    long h1 = mp_headroom_mb(); uint64_t gpu1 = g_dev.currentAllocatedSize >> 20, fp1 = mp_footprint_mb();
+    MLOG("memory pressure: tier %d (%s, frame %llu), headroom %ld -> %ld MB (-1 = unknown), footprint %llu -> %llu MB, GPU allocated %llu -> %llu MB: %s, malloc relief", tier, rn[reason], (unsigned long long)frame, h0, h1, (unsigned long long)fp0, (unsigned long long)fp1, (unsigned long long)gpu0, (unsigned long long)gpu1, out);
+}
 void mtl_exec(const uint8_t *p) {
     static int inited; if (!inited) { inited = 1; state_reset(); }
     static int dump_all = -1; if (dump_all < 0) dump_all = getenv("DM_NVN_PASSDUMP_ALL") != NULL;
