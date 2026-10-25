@@ -7,24 +7,13 @@
 // (an idle GPU often runs them in order anyway, and the bug seen in Metroid Dread needed a busy one), so the data check alone cannot be trusted to fail without the barriers.
 // Usage: t_up_order
 #include "../nvn/nvn_mtl.m"
-int prog_key(const prog_t *p, unsigned stage, uint8_t key[8]) { (void)p; (void)stage; memset(key, 0, 8); return 0; }
+uint64_t g_t0_ns;
+int dm_guest_as_contains(uintptr_t address) { (void)address; return 0; }
 void *front_metal_layer(void) { return NULL; }
 module_t *module_of(const void *p) { (void)p; return NULL; }
 module_t g_mod[MAX_MOD]; int g_nmod;
 void svc_thread_dump(void) {}
 uint64_t now_ns(void) { return bp_now(); }
-
-// symbols of hle_nvn.c, which this test does not link: no sparse pools, every address readable, descriptor pools at ID 0
-int nvn_host_readable(uint64_t a, uint64_t n) { (void)a; (void)n; return 1; }
-uint64_t nvn_new_serial(void) { static uint64_t n = 90000; return ++n; }
-int nvn_sparse_pool(const void *pool) { (void)pool; return 0; }
-uint64_t nvn_sparse_gen(void) { return 0; }
-uint64_t nvn_sparse_copy(const void *pool, void *dst, uint64_t a, uint64_t n) { (void)pool; (void)dst; (void)a; (void)n; return 0; }
-int nvn_sparse_since(const void *pool, uint64_t a, uint64_t n, uint64_t gen, uint64_t stamp) { (void)pool; (void)a; (void)n; (void)gen; (void)stamp; return 0; }
-void nvn_sparse_protect(const void *pool, uint64_t a, uint64_t n) { (void)pool; (void)a; (void)n; }
-int nvn_sparse_mapped(const void *pool, uint64_t a, uint64_t n) { (void)pool; (void)a; (void)n; return 1; }
-int nvn_dpool_base(const void *pool, int tex) { (void)pool; (void)tex; return 0; }
-int nvn_flushed(const void *p, uint64_t n) { (void)p; (void)n; return 0; }
 
 static int failed;
 #define CHECK(c, ...) do { if (!(c)) { failed++; printf("  ✗ "); printf(__VA_ARGS__); printf("\n"); } } while (0)
