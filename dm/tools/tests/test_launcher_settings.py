@@ -14,7 +14,7 @@ spec = importlib.util.spec_from_file_location('launcher_settings', ROOT / 'dm/ga
 settings = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(settings)
 
-BOTW, WONDER = '01007EF00011E000', '010015100B514000'
+BOTW, WONDER, DREAD = '01007EF00011E000', '010015100B514000', '010093801237C000'
 PERFORMANCE_NVN = ['DM_PRESENT_SNAP', 'DM_PSO_MTL4', 'DM_PSO_PREBUILD', 'DM_NVN_ENC_THREAD', 'DM_FPS_HOLD', 'DM_METAL_HUD']
 
 
@@ -52,6 +52,16 @@ class LauncherSettingsTests(unittest.TestCase):
         self.assertEqual(list(dict.fromkeys(s['section'] for s in botw.values())), ['Game', 'Controls', 'Performance'])
         self.assertNotIn('DM_FPS_HOLD', wonder)   # no frame step, as the Frame rate row
         self.assertIn('first start', botw['DM_PSO_PREBUILD']['note'])   # it runs once in the prepare step, before the first frame
+
+    def test_host_frame_cap_row_is_for_games_verified_to_step_by_elapsed_time(self):   # DM_FPS (Auto / 30): fps_cap 1 (Dread only), never with the DM_FPS_TARGET row
+        dread = build(DREAD, 'nvn')
+        self.assertNotIn('DM_FPS_TARGET', dread)
+        s = dread['DM_FPS']
+        self.assertEqual((s['kind'], s['section'], s['default'], s['options']), ('choice', 'Game', '0', [['0', 'Auto'], ['30', '30 fps']]))
+        for api, gid in [('nvn', BOTW), ('nvn', WONDER)]:
+            with self.subTest(gid=gid):
+                rows = build(gid, api)
+                self.assertNotIn('DM_FPS', rows)
 
     def test_hold_frames_takes_on_and_off(self):   # the host reads DM_FPS_HOLD as on / off (hle_nvn.c), not 1 / 0
         s = build(BOTW, 'nvn')['DM_FPS_HOLD']

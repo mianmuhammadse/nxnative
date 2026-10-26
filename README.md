@@ -62,8 +62,6 @@ Controls, saves and settings: [Playing](docs/playing.md).
 Games tested on Mac or iPhone. See the [per-game notes](dm/games/README.md#games) for tested platforms, progress and known issues:
 
 Needs iOS / iPadOS 26 or later on an iPhone 15 Pro or newer (A17 Pro chip or later) or an iPad with an M1 chip or later: the games' textures are BC-compressed, and older iPhones can't read that format. Other games aren't supported yet. For them the script writes a survey and still tries its best to pack an IPA, guessing the game's settings; such an IPA may not start.
-**Auto / 30 fps.** Metroid Dread shows an **Auto** button at the top, beside the frame-rate counter's place: tap it to switch between Auto (60 fps in play, 30 in cutscenes) and a fixed 30 fps, which runs the GPU less and keeps the phone cooler and the battery longer. The app remembers your choice, and the button works with a controller connected. It is only offered for a game whose speed does not depend on the frame rate (a game that counts frames would run in slow motion at 30); `DM_FPS_SWITCH=1` in `Documents/env.txt` shows it for any game, to try.
-
 **Shaking.** Shake the iPhone to shake the controller, in games that read its motion: Super Mario Odyssey's motion moves (such as the cap throw on a shake) need it, and Odyssey only takes them in its default docked mode. A light bump does not count; a sharp flick of the phone does.
 
 Under a game, "60 fps with 1.2.0" means it runs at 60 fps (30 on the Switch) with that update.

@@ -22,6 +22,9 @@ shader_versions	v327680
 # load order as on Horizon: main, subsdk*, sdk (subsdk0 = NintendoSDK_movie 11.4.3)
 modules	main subsdk0 sdk
 romfs_marker	system/shd
+# ---- Frame rate ----
+# Steps by elapsed time (verified with DM_FPS=30: game speed normal), so the launcher offers Auto / 30 fps
+fps_cap	1
 zip_store	.bctex:.webm:.bfstm:.metallib
 
 # ---- Memory ----
@@ -37,5 +40,3 @@ app_pool	0xCD500000
 shader_groups	/system/shd/=shd
 shader_note	Metroid Dread shaders
 
-# In-game Auto / 30 fps switch on iOS: Dread steps by the time that passed, so 30 fps is normal speed (a frame-counting game would run in slow motion)
-fps_switch	1
