@@ -3,3 +3,4 @@ t_fmt_mtl
 *.dSYM
 asan/
 cov/
+t_bc2astc

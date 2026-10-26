@@ -27,3 +27,9 @@ coverage:
 	$(MAKE) O=cov/ SAN="$(COV_FLAGS)" cov/t_tex
 	-LLVM_PROFILE_FILE="$(call cov_profile,cov)" ./cov/t_tex
 	@$(call cov_export,cov)
+t_bc2astc: t_bc2astc.c ../nvn_bc2astc.c ../nvn_bc2astc.h ../bc2astc_core.h ../../../third_party/bcdec/bcdec.h
+	clang $(CFLAGS) -o $@ t_bc2astc.c ../nvn_bc2astc.c -lm
+# Needs the astcenc binary (ARM-software/astc-encoder): make ASTCENC=/path/to/astcenc astc
+astc: t_bc2astc
+	ASTCENC=$(ASTCENC) ./t_bc2astc
+.PHONY: run astc
