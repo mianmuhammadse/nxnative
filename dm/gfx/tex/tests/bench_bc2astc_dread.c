@@ -1,14 +1,17 @@
 // Benchmark of the BC1/BC2/BC3 → ASTC 4x4 transcoder (bc2astc_core.h) on a real game: every BC1/BC3 block of Metroid Dread's textures goes through the C transcoder, is decoded with ARM's astcenc and
 // compared with bcdec. Reports the share of blocks per layout and format, bytes per format (native BC / decompressed to RGBA8 / ASTC), RGB and alpha error overall, per texture (median, percentiles, worst 1%).
 // The .bctex parsing is Dread-specific (MercurySteam's container: "MTXT" + gzip; inside, an NVN texture header with the format at +0xc8, the data size at +0xac, the block height at +0x118 and the block-linear
-// data at +0x154); any other game needs its own reader. No game data lives in the repository: the extracted RomFS is an argument.
-// Usage: bench_bc2astc_dread <RomFS folder> <astcenc binary> <output folder>   (writes report.txt and textures.csv there; the folder also holds the scratch files of the astcenc calls)
+// data at +0x124 + the offset stored at +0x134 (0x278 in every file seen)); any other game needs its own reader. No game data lives in the repository: the extracted RomFS is an argument.
+// Usage: bench_bc2astc_dread <RomFS folder> <astcenc binary> <output folder> [<keep table.tsv> <alpha PSNR threshold in dB>]
+//   writes report.txt and textures.csv into the output folder (which also holds the scratch files of the astcenc calls); with the last two arguments it also writes the BC3 keep table: one line per BC3
+//   texture whose alpha PSNR after the ASTC transcode is below the threshold, keyed by nvn_texkey of the packaged storage (dm/games/<id>/bc3_keep_rgba8.tsv, read by the host)
 //   make -C dm/gfx/tex/tests bench ROMFS=<RomFS folder> ASTCENC=<astcenc> OUT=<folder>
 #define _DARWIN_C_SOURCE
 #define BCDEC_IMPLEMENTATION
 #include "../../../third_party/bcdec/bcdec.h"
 #include "../nvn_deswizzle.h"
 #include "../nvn_bc2astc.h"
+#include "../nvn_texkey.h"
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -60,7 +63,7 @@ static int astc_decode(const uint8_t *blocks, int nbx, int nby, uint8_t *rgba) {
     free(lin); free(d); return 0;
 }
 
-typedef struct { char name[160]; int fmt; long blocks, lay[5], l3_swapped; double se_a, se_rgb, se_a_l3; long na, nrgb, na_l3; int maxa, maxrgb, maxa_l3; double psnr_a, psnr_a_l3; } tex_t;
+typedef struct { char name[160]; uint64_t key; unsigned w, h; int fmt; long blocks, lay[5], l3_swapped; double se_a, se_rgb, se_a_l3; long na, nrgb, na_l3; int maxa, maxrgb, maxa_l3; double psnr_a, psnr_a_l3; } tex_t;
 typedef struct { long files, blocks, lay[5]; double bc_bytes, unp_bytes, astc_bytes; } fmt_t;
 static double psnr(double se, long n) { return se == 0 ? 99.0 : 10.0 * log10(255.0 * 255.0 / (se / n)); }
 static int cmp_psnr(const void *a, const void *b) { double x = ((const tex_t *)a)->psnr_a, y = ((const tex_t *)b)->psnr_a; return x < y ? -1 : x > y; }
@@ -80,7 +83,8 @@ static void walk(const char *dir) {   // every *.bctex below dir, sorted for rep
 static int cmp_str(const void *a, const void *b) { return strcmp(*(char *const *)a, *(char *const *)b); }
 
 int main(int argc, char **argv) {
-    if (argc < 4) { fprintf(stderr, "usage: %s <RomFS folder> <astcenc binary> <output folder>\n", argv[0]); return 2; }
+    const char *keep_path = argc > 5 ? argv[4] : 0; double keep_thr = argc > 5 ? atof(argv[5]) : 0;
+    if (argc < 4 || argc == 5) { fprintf(stderr, "usage: %s <RomFS folder> <astcenc binary> <output folder> [<keep table.tsv> <threshold dB>]\n", argv[0]); return 2; }
     astcenc = argv[2]; tmpdir = argv[3];
     walk(argv[1]); qsort(files, nfiles, sizeof *files, cmp_str);
     if (!nfiles) { fprintf(stderr, "no .bctex files below %s\n", argv[1]); return 2; }
@@ -93,9 +97,10 @@ int main(int argc, char **argv) {
     while (fi < nfiles) {
         snprintf(path, sizeof path, "%s", files[fi++]);
         size_t n; uint8_t *r = inflate_file(path, &n);
-        if (!r || n < 0x160 || rd32(r + 0x88) != 0x4e764248) { unparsed++; free(r); continue; }
+        if (!r || n < 0x280 || rd32(r + 0x88) != 0x4e764248 || rd32(r + 0x124) != 0x4e764248) { unparsed++; free(r); continue; }
         uint32_t W = rd32(r + 8), H = rd32(r + 12), mips = rd32(r + 16), dsz = rd32(r + 0xac), fmt = rd32(r + 0xc8), blk = rd32(r + 0x118);
-        if (0x154 + (size_t)dsz > n || fmt > 255 || !mips || mips > 16) { unparsed++; free(r); continue; }
+        size_t doff = 0x124 + (size_t)rd32(r + 0x134);   // the storage the game hands to NVN
+        if (rd32(r + 0x12c) != dsz || doff + (size_t)dsz > n || fmt > 255 || !mips || mips > 16) { unparsed++; free(r); continue; }
         parsed++;
         int kind = 0; uint32_t pf; if (nvn_bc_astc_fmt(fmt, &pf, &kind)) {} 
         int bb = 0, bw = 0, bh = 0; bb = nvn_fmt_bpb((int)fmt, &bw, &bh);
@@ -120,11 +125,11 @@ int main(int argc, char **argv) {
             uint32_t rb, rows, slices, bpb; uint64_t base; unsigned th, td;
             if (nvn_deswizzle_geom(&d, l, 0, &rb, &rows, &slices, &base, &th, &td, &bpb)) continue;
             uint8_t *lin = malloc((size_t)rb * rows);
-            if (nvn_deswizzle(&d, l, 0, r + 0x154, lin, rb)) { free(lin); continue; }
+            if (nvn_deswizzle(&d, l, 0, r + doff, lin, rb)) { free(lin); continue; }
             for (uint32_t i = 0; i < rows * (rb / bpb); i++) memcpy(bcs + (size_t)(nb + i) * 16, lin + (size_t)i * bpb, bpb);
             nb += rows * (rb / bpb); free(lin);
         }
-        tex_t *t = &T[nt++]; const char *sl = strrchr(path, '/'); snprintf(t->name, sizeof t->name, "%s", sl ? sl + 1 : path); t->fmt = (int)fmt; t->blocks = nb;
+        tex_t *t = &T[nt++]; t->key = nvn_texkey(r + doff, dsz, fmt, W, H, mips); t->w = W; t->h = H; const char *sl = strrchr(path, '/'); snprintf(t->name, sizeof t->name, "%s", sl ? sl + 1 : path); t->fmt = (int)fmt; t->blocks = nb;
         for (long i = 0; i < nb; i++) { uint32_t o = nvn_bc2astc_block(kind, bcs + (size_t)i * 16, astc + (size_t)i * 16); lays[i] = (uint8_t)(o & 0xff); t->lay[o & 0xff]++; if ((o & 0x100) && (o & 0xff) == 4) t->l3_swapped++; e->lay[o & 0xff]++; }
         e->blocks += nb;
         int nbx = nb < 64 ? (int)nb : 64, nby = (int)((nb + nbx - 1) / nbx);
@@ -169,7 +174,15 @@ int main(int argc, char **argv) {
         if (!cnt) { printf("\nBC%d: no textures\n", kind); continue; }
         printf("\nBC%d alpha on real blocks: %d textures, %ld blocks (%ld in L3 = %.1f%%): all blocks PSNR %.2f dB, max err %d; L3 blocks only PSNR %.2f dB, max err %d\n", kind, cnt, allb, l3b, 100.0 * l3b / allb, psnr(se, n), mx, nl3 ? psnr(sel3, nl3) : 99.0, mxl3);
     }
-    { FILE *cf = fopen(csv, "w"); fprintf(cf, "name,fmt,blocks,l3_blocks,alpha_psnr,alpha_max,rgb_psnr,rgb_max\n"); for (int i = 0; i < nt; i++) fprintf(cf, "%s,0x%02x,%ld,%ld,%.3f,%d,%.3f,%d\n", T[i].name, T[i].fmt, T[i].blocks, T[i].lay[4], T[i].psnr_a, T[i].maxa, psnr(T[i].se_rgb, T[i].nrgb), T[i].maxrgb); fclose(cf); }
+    if (keep_path) {   // BC3 textures below the threshold, one line per distinct key
+        FILE *kf = fopen(keep_path, "w"); if (!kf) { fprintf(stderr, "cannot write %s\n", keep_path); return 2; }
+        fprintf(kf, "# bc3_keep_rgba8 v1: BC3 textures kept RGBA8 on GPUs without BC (alpha PSNR after the ASTC transcode below %.1f dB); written by bench_bc2astc_dread\n# key (nvn_texkey, hex)\tnvn format\twidth\theight\talpha PSNR\tname\n", keep_thr);
+        tex_t **sel = malloc(nt * sizeof *sel); int ns = 0; for (int i = 0; i < nt; i++) if (T[i].fmt == 0x44 && T[i].psnr_a < keep_thr) sel[ns++] = &T[i];
+        for (int i = 0; i < ns; i++) for (int j = i + 1; j < ns; j++) if (sel[j]->key < sel[i]->key) { tex_t *t = sel[i]; sel[i] = sel[j]; sel[j] = t; }
+        for (int i = 0; i < ns; i++) if (!i || sel[i]->key != sel[i - 1]->key) fprintf(kf, "%016llx\t0x%02x\t%u\t%u\t%.2f\t%s\n", (unsigned long long)sel[i]->key, sel[i]->fmt, sel[i]->w, sel[i]->h, sel[i]->psnr_a, sel[i]->name);
+        fclose(kf); free(sel);
+    }
+    { FILE *cf = fopen(csv, "w"); fprintf(cf, "name,fmt,blocks,l3_blocks,alpha_psnr,alpha_max,rgb_psnr,rgb_max,key\n"); for (int i = 0; i < nt; i++) fprintf(cf, "%s,0x%02x,%ld,%ld,%.3f,%d,%.3f,%d,%016llx\n", T[i].name, T[i].fmt, T[i].blocks, T[i].lay[4], T[i].psnr_a, T[i].maxa, psnr(T[i].se_rgb, T[i].nrgb), T[i].maxrgb, (unsigned long long)T[i].key); fclose(cf); }
     // worst 1% of BC3 textures by alpha PSNR
     tex_t *b3 = malloc(nt * sizeof *b3); int n3 = 0; for (int i = 0; i < nt; i++) if (T[i].fmt == 0x44) b3[n3++] = T[i];
     qsort(b3, n3, sizeof *b3, cmp_psnr);
