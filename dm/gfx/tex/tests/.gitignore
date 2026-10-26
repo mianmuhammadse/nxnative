@@ -4,3 +4,4 @@ t_fmt_mtl
 asan/
 cov/
 t_bc2astc
+bench_bc2astc_dread
