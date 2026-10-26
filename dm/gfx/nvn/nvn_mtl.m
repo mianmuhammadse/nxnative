@@ -9469,12 +9469,12 @@ static const char *cctx_snap(void) {
 }
 // When the game itself asks for 30 fps (pacing by the game's present interval, interval 2, hle_nvn.c) the display link runs at 30 Hz too: games whose logic counts frames, such as Engage, are not pulled up to 60 fps by the display link on iOS
 __attribute__((weak)) int nvn_game_fps(void) { return 60; }   // hle_nvn.c provides the strong definition
-// The frame-rate override: 0 = auto (the game's own request above), 30 or 60 = pinned. DM_FPS from the environment sets the first value; the player's in-game Auto / 30 switch (front_ios.m, mtl_fps_set) replaces it at any time, so every reader calls mtl_fps_target each time and
+// The frame-rate override: 0 = auto (the game's own request above), 30 or 60 = pinned. DM_FPS from the environment (the launcher's Frame rate row for a game without its own, settings.tsv) sets the first value; mtl_fps_set can replace it at any time, so every reader calls mtl_fps_target each time and
 // link_sync follows within a frame. -1 = not read yet
 static _Atomic int g_fps_user = -1;
 static int fps_env(void) {
     const char *e = getenv("DM_FPS"); int v = e ? atoi(e) : 0;
-    if (v != 30 && v != 60) v = 0; else MLOG("DM_FPS=%d: frame rate pinned by the test switch", v);
+    if (v != 30 && v != 60) v = 0; else MLOG("DM_FPS=%d: frame rate pinned (launcher Frame rate row / env)", v);
     return v;
 }
 int mtl_fps_user(void) { int u = atomic_load(&g_fps_user); if (u < 0) { int e = fps_env(), x = -1; atomic_compare_exchange_strong(&g_fps_user, &x, e); u = atomic_load(&g_fps_user); } return u; }
@@ -10705,9 +10705,6 @@ static void *link_main(void *arg) {   // Display link thread: started when switc
 }
 static void link_sync(void) {   // Called every frame by the game's present thread: aligns the display link object's state to g_dm_present_link and the power-saving mode (can change at run time)
     static int applied;
-    static const char *sched; static int sched_init;   // DM_FPS_SCHEDULE=frame:fps,frame:fps (fps 0 / 30 / 60): the in-game switch from the environment, for Mac runs
-    if (!sched_init) { sched_init = 1; sched = getenv("DM_FPS_SCHEDULE"); }
-    if (sched && *sched) { char *end; unsigned long long at = strtoull(sched, &end, 10); if (*end == ':' && atomic_load(&g_cur_frame) >= at) { mtl_fps_set(atoi(end + 1)); const char *c = strchr(end, ','); sched = c ? c + 1 : ""; } }
     pthread_mutex_lock(&g_pq_mu);
     int want = g_dm_present_link;
     if (want < 0 || want > 2) { g_dm_present_link = applied == 3 ? 1 : applied; pthread_mutex_unlock(&g_pq_mu); return; }

@@ -200,8 +200,6 @@ A connected game controller hides the touch controls and keeps every button.
 
 **Rumble.** Game vibration uses the iPhone's haptic engine or a compatible connected controller. Controllers with separate left/right haptic outputs keep those effects separate. The launcher's **Game rumble** and **Rumble strength** settings control it independently of **Touch feedback**. Phone rumble approximates the Switch's effects; physical feel and controller compatibility still need device testing.
 
-**Auto / 30 fps.** Metroid Dread shows an **Auto** button at the top, beside the frame-rate counter's place: tap it to switch between Auto (60 fps in play, 30 in cutscenes) and a fixed 30 fps, which runs the GPU less and keeps the phone cooler and the battery longer. The app remembers your choice, and the button works with a controller connected. It is only offered for a game whose speed does not depend on the frame rate (a game that counts frames would run in slow motion at 30); `DM_FPS_SWITCH=1` in `Documents/env.txt` shows it for any game, to try.
-
 **Shaking.** Shake the iPhone to shake the controller, in games that read its motion: Super Mario Odyssey's motion moves (such as the cap throw on a shake) need it, and Odyssey only takes them in its default docked mode. A light bump does not count; a sharp flick of the phone does.
 
 - **Game language** is English by default. Pick another when packing with `--language` (`-l`), by code or by name: `-l ja`, `-l zh-Hans`, `-l French` (`LANGUAGE` in Spyder). It must be one the game has; the script prints the game's languages and stops on one it lacks. To change it without rebuilding, pick another on the settings screen.

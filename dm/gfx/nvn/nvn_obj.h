@@ -208,7 +208,7 @@ uint64_t mtl_udc_saved_bytes(void);                                      // Writ
 int mtl_has_window(void);
 void mtl_mem_pressure_request(int tier, int reason);       // memory-pressure response (nvn_mtl.m): tier 1 / 2 and why (3 = the app's memory warning); trims at the next submission
 void mtl_mem_pressure_tick(uint64_t frame);                 // every frame from the present thread: the headroom watermark every 30 frames
-void mtl_fps_set(int v);                                   // frame-rate override: 0 = auto, 30 / 60 = pinned (the in-game Auto / 30 switch, front_ios.m); any thread
+void mtl_fps_set(int v);                                   // frame-rate override: 0 = auto, 30 / 60 = pinned (DM_FPS sets the first value); any thread
 int mtl_fps_user(void);                                    // the override now (0 / 30 / 60)
 int mtl_fps_target(void);                                   // target frame rate 30 / 60 (power-saving mode, DM_FPS, the game itself asking for 30)
 int mtl_warm_wait(int timeout_ms);
