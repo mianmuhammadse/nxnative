@@ -2,7 +2,7 @@
 // the test queues the content copies BEFORE the zero fill (the worst order) and flushes through the real up_flush, then reads the texture back (ASTC blocks, byte for byte).
 //   A  content copy queued, then zero fill, same batch  → the content
 //   B  zero fill alone                                  → the constant (0,0,0,0) ASTC block (an all-zero block would be invalid)
-//   C  a `bca` transcoding job + the copy of its output, then zero fill, same batch → the transcoded blocks (kernel dispatch before the copy, copy after the fill)
+//   C  a large `bca` transcoding job + the copy of its output, then zero fill, same batch → the transcoded blocks (kernel finished before the copy starts, copy after the fill)
 // Usage: t_up_order
 #include "../nvn/nvn_mtl.m"
 int prog_key(const prog_t *p, unsigned stage, uint8_t key[8]) { (void)p; (void)stage; memset(key, 0, 8); return 0; }
@@ -66,20 +66,29 @@ int main(void) {
         int ok = 1; for (int b = 0; b < 4; b++) ok &= !memcmp(got + b * 16, zero, 16);
         CHECK(ok, "B: zero fill does not leave the constant ASTC block");
     }
-    {   // C: GPU transcoding job (BC3 blocks in a buffer → ASTC blocks in the same buffer) + the copy of its output + zero fill, one batch
-        id<MTLTexture> t = new_astc();
-        uint8_t stage[64 + 64]; memset(stage, 0xCD, sizeof stage); memcpy(stage, bc[0], 16); memcpy(stage + 16, bc[1], 16); memcpy(stage + 32, bc[2], 16); memcpy(stage + 48, bc[3], 16);   // 2x2 BC3 blocks, row pitch 32, then 64 bytes of output
-        id<MTLBuffer> stg = [g_dev newBufferWithBytes:stage length:sizeof stage options:MTLResourceStorageModeShared]; res_add(stg);
+    {   // C: GPU transcoding job (BC3 blocks in a buffer → ASTC blocks in the same buffer) + the copy of its output + zero fill, one batch. Large (512x512 blocks): a copy that is not ordered after
+        // the kernel starts before the kernel has written its blocks and reads zeros, which a handful of blocks never shows
+        const uint32_t NB = 512, N = NB * NB; const size_t BYTES = (size_t)N * 16;
+        MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatASTC_4x4_LDR width:NB * 4 height:NB * 4 mipmapped:NO];
+        d.usage = MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView; d.storageMode = MTLStorageModePrivate; id<MTLTexture> t = [g_dev newTextureWithDescriptor:d]; res_add(t);
+        uint8_t *stage = calloc(1, BYTES * 2), *wantbig = malloc(BYTES); uint32_t s2 = 777;
+        for (uint32_t i = 0; i < N; i++) { uint8_t *b3 = stage + (size_t)i * 16; for (int k = 0; k < 16; k++) { s2 = s2 * 1664525u + 1013904223u; b3[k] = (uint8_t)(s2 >> 24); } nvn_bc2astc_block(3, b3, wantbig + (size_t)i * 16); }
+        id<MTLBuffer> stg = [g_dev newBufferWithBytes:stage length:BYTES * 2 options:MTLResourceStorageModeShared]; res_add(stg);
         up_begin();
         size_t qoff; id<MTLBuffer> q = up_param_alloc(&qoff);
-        uint32_t *pp = (uint32_t *)((uint8_t *)q.contents + qoff); pp[0] = 0; pp[1] = 32; pp[2] = 64; pp[3] = 32; pp[4] = 2; pp[5] = 2; pp[6] = 3;
+        uint32_t *pp = (uint32_t *)((uint8_t *)q.contents + qoff); pp[0] = 0; pp[1] = NB * 16; pp[2] = (uint32_t)BYTES; pp[3] = NB * 16; pp[4] = NB; pp[5] = NB; pp[6] = 3;
         if (g_nup_asts == g_up_astcap) { g_up_astcap = g_up_astcap ? g_up_astcap * 2 : 16; g_up_asts = realloc(g_up_asts, g_up_astcap * sizeof *g_up_asts); }
-        g_up_asts[g_nup_asts++] = (up_ast){stg, q, qoff, 2, 2};
-        up_blit_add(stg, 64, 32, 64, MTLSizeMake(8, 8, 1), t, 0, 0); [g_up_texs addObject:t];
+        g_up_asts[g_nup_asts++] = (up_ast){stg, q, qoff, NB, NB};
+        up_blit_add(stg, BYTES, NB * 16, BYTES, MTLSizeMake(NB * 4, NB * 4, 1), t, 0, 0); [g_up_texs addObject:t];
         tex_zero_fill(t, 1);
         up_flush(); wait_uploads();
-        uint8_t got[64]; read_back(t, got);
-        CHECK(!memcmp(got, want, 64), "C: transcoded blocks do not end up in the texture (dispatch, fill and copy out of order)");
+        id<MTLBuffer> dst = [g_dev newBufferWithLength:BYTES options:MTLResourceStorageModeShared]; res_add(dst);
+        id read = blit();
+        [read copyFromTexture:t sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(NB * 4, NB * 4, 1) toBuffer:dst destinationOffset:0 destinationBytesPerRow:NB * 16 destinationBytesPerImage:BYTES];
+        enc_b_end(g_blit); g_blit = nil; mtl_sub_commit(); mtl_drain(); mtl_sub_begin();
+        size_t bad = 0; for (uint32_t i = 0; i < N; i++) bad += memcmp((uint8_t *)dst.contents + (size_t)i * 16, wantbig + (size_t)i * 16, 16) != 0;
+        CHECK(bad == 0, "C: %zu of %u transcoded blocks do not end up in the texture (the copy ran before the kernel finished, or fill and copy out of order)", bad, N);
+        free(stage); free(wantbig);
     }
     printf("up_flush order: %s\n", failed ? "FAILED" : "ok (content queued before the zero fill still wins; kernel output copied after the dispatch)");
     return failed != 0;
