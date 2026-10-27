@@ -14,7 +14,8 @@ static int hid_clock_gettime(clockid_t clock, struct timespec *ts) { (void)clock
 #define CHECK(c, msg) do { checks++; if (!(c)) { fails++; fprintf(stderr, "FAIL: %s (line %d)\n", msg, __LINE__); } } while (0)
 int dm_opmode(void) { return g_mode; }
 uint64_t guest_ns(void) { return 1000000000ull; }
-uint64_t now_ns(void) { return 1000000000ull; }
+static uint64_t g_now = 1000000000ull;
+uint64_t now_ns(void) { return g_now; }
 uint64_t dm_guest_frame(void) { return 0; }
 void dm_touch_set(const dm_touch *t, int n) { (void)t; (void)n; }
 int touch_fill_n(void *out, int max, uint64_t now) { (void)out; (void)max; (void)now; return 0; }
@@ -206,12 +207,40 @@ static void t_rumble_log(void) {
     unsetenv("DM_RUMBLE_LOG");
 }
 
+// Six-axis: the flat sensor without a live sample, the phone's with one (every history entry repeats it, the angle stepped back), a stale one dropped, a shake over it
+static void t_six_live(void) {
+    SixAxisState s; dm_motion m; memset(&m, 0, sizeof m);
+    g_now = 1000000000ull; dm_motion_set(NULL);
+    dm_motion q; CHECK(!motion_get(&q), "no live sample before the front end publishes one");
+    six_sample(&s, 200, 1, NULL, 0);
+    CHECK(s.acc[2] == -1 && s.acc[0] == 0 && s.dir[0] == 1 && s.dir[4] == 1 && s.dir[8] == 1, "flat and still without motion");
+    m.acc[0] = 0.25f; m.acc[1] = -0.5f; m.acc[2] = -0.75f; m.gyro[2] = 0.5f; m.angle[2] = 0.1f;
+    m.dir[0] = 0; m.dir[1] = 1; m.dir[3] = -1; m.dir[4] = 0; m.dir[8] = 1;
+    dm_motion_set(&m);
+    CHECK(motion_get(&q) && q.acc[1] == -0.5f, "a published sample is read back");
+    six_sample(&s, 200, 1, &q, 0);
+    CHECK(s.acc[0] == 0.25f && s.acc[1] == -0.5f && s.acc[2] == -0.75f && s.gyro[2] == 0.5f && s.dir[1] == 1 && s.dir[3] == -1, "the newest entry carries the live sample");
+    CHECK(s.attributes == 1 && s.sampling == 200 && s.delta_ns == SIX_PERIOD_NS, "the live entry is a connected sample with its number");
+    six_sample(&s, 199, 1, &q, 1);
+    CHECK(fabs(s.angle[2] - (0.1 - 0.5 * 0.005)) < 1e-6, "an older entry's angle is stepped back by one period of the angular velocity");
+    g_now += 100000000ull; CHECK(motion_get(&q), "100 ms old: still fresh");
+    g_now += 200000000ull; CHECK(!motion_get(&q), "300 ms old: dropped, the sensor lies flat again");
+    g_now = 1000000000ull; dm_motion_set(&m); dm_motion_set(NULL); CHECK(!motion_get(&q), "withdrawn");
+    // a detected shake plays over the live sample, only on player 1's sensor
+    dm_motion_set(&m);
+    atomic_store(&g_shake_t0, 0); atomic_store(&g_shake_end, UINT64_MAX);
+    six_sample(&s, 200, 1, &m, 0); CHECK(s.acc[1] == 0 && s.dir[1] != 1, "a shake replaces the live sample while it plays");
+    six_sample(&s, 200, 0, &m, 0); CHECK(s.acc[0] == 0.25f, "other players' sensors ignore the shake");
+    atomic_store(&g_shake_end, 0); dm_motion_set(NULL);
+}
+
 int main(void) {
     CHECK(setenv("DM_RUMBLE_LOG", "1", 1) == 0, "enable rumble diagnostics");
     t_slots();
     t_npads();
     t_vibration();
     t_rumble_log();
+    t_six_live();
     printf("hid players: %d checks, %d failed\n", checks, fails);
     return fails != 0;
 }
