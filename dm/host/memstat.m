@@ -102,13 +102,15 @@ static void *memstat_thread(void *p) {
     return NULL;
 }
 
-__attribute__((constructor)) static void memstat_start(void) {
+// Called from dm_main once the environment is final (on iOS main.m has read env.txt by then; a constructor would run before main and see none of it)
+void dm_memstat_start(void) {
     const char *p = getenv("DM_MEMSTAT");
     if (!p || !*p) return;
     char *path = strdup(p);
 #if TARGET_OS_IPHONE
-    if (*p != '/') { size_t n = strlen(getenv("HOME")) + strlen(p) + 16; path = malloc(n); snprintf(path, n, "%s/Documents/%s", getenv("HOME"), p); }   // Relative name → the container's Documents (the container path is not known before launch)
+    if (*p != '/') { size_t n = strlen(getenv("HOME")) + strlen(p) + 16; path = malloc(n); snprintf(path, n, "%s/Documents/%s", getenv("HOME"), p); }   // Relative name → the container's Documents
 #endif
+    LOG("memstat: writing %s", path);
     pthread_t th; pthread_create(&th, NULL, memstat_thread, path); pthread_detach(th);
 }
 
@@ -119,7 +121,7 @@ __attribute__((constructor)) static void memstat_start(void) {
 #define THR_MAX 512
 static void *thrcpu_thread(void *p) {
     char path[1024]; int iv = 10; { const char *c = strchr((const char *)p, ','); snprintf(path, sizeof path, "%.*s", c ? (int)(c - (const char *)p) : (int)strlen(p), (const char *)p); if (c) iv = atoi(c + 1); }
-    FILE *f = fopen(path, "w"); if (!f) return NULL;
+    FILE *f = fopen(path, "w"); if (!f) { LOG("thrcpu: cannot open %s", path); return NULL; }
     fprintf(f, "seconds\tthread ID\tthread name\tCPU%%\n"); fflush(f);
     static uint64_t ids[THR_MAX], last[THR_MAX]; int n = 0; uint64_t t0 = now_ns(), tl = t0;
     for (;;) {
@@ -144,7 +146,7 @@ static void *thrcpu_thread(void *p) {
     }
     return NULL;
 }
-__attribute__((constructor)) static void thrcpu_start(void) {
+void dm_thrcpu_start(void) {
     const char *p = getenv("DM_THRCPU");
     if (!p || !*p) return;
     char *spec = strdup(p);
