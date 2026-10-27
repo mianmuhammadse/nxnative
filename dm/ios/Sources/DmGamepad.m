@@ -90,14 +90,14 @@ static void motion_start(void) {
         BOOL held = since > 0 && d.timestamp - since >= 1.0;
         if (!held) recentred = NO;
         if (!haveYaw || (held && !recentred)) {
-            yaw0 = dm_motion_yaw(hr, m); angle[0] = angle[1] = angle[2] = 0;
-            if (haveYaw) LOG("front end: motion recentred");
+            double was = yaw0; yaw0 = dm_motion_yaw(hr, m); angle[0] = angle[1] = angle[2] = 0;
+            if (haveYaw) LOG("front end: motion recentred, heading %.1f -> %.1f deg (landscape %s)", was * 180 / M_PI, yaw0 * 180 / M_PI, hr ? "right" : "left");
             haveYaw = YES; recentred = held;
         }
         double ga[3] = {d.gravity.x + u.x, d.gravity.y + u.y, d.gravity.z + u.z}, ro[3] = {d.rotationRate.x, d.rotationRate.y, d.rotationRate.z}, a[3], w[3];
         dm_motion_vec(hr, ga, a); dm_motion_vec(hr, ro, w);
         double dt = prev >= 0 ? fmin(d.timestamp - prev, 0.1) : 0; prev = d.timestamp;
-        dm_motion s;
+        dm_motion s; s.home_right = hr;
         for (int k = 0; k < 3; k++) {
             s.acc[k] = (float)a[k]; s.gyro[k] = (float)(w[k] / (2 * M_PI));
             angle[k] += w[k] / (2 * M_PI) * dt; s.angle[k] = (float)angle[k];

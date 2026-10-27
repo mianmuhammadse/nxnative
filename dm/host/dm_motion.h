@@ -8,7 +8,7 @@
 #include <math.h>
 #include <stdint.h>
 
-typedef struct { float acc[3], gyro[3], angle[3], dir[9]; } dm_motion;   // acc in G, gyro in revolutions / s, angle in revolutions, controller frame
+typedef struct { float acc[3], gyro[3], angle[3], dir[9]; int home_right; } dm_motion;   // acc in G, gyro in revolutions / s, angle in revolutions, controller frame; home_right: the interface orientation it was mapped for (only logged)
 void dm_motion_set(const dm_motion *m);   // publishes the newest sample; NULL withdraws it (the sensor lies flat again)
 
 // ---- the frame mapping (pure; shared by the iOS front end and tests/t_motion.c) ----

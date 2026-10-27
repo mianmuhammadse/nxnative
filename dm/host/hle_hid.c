@@ -358,6 +358,14 @@ static int six_states(SixAxisState *out, int n, uint32_t h) {
     dm_motion mot; int live = shakes && motion_get(&mot);
     static _Atomic int logged; if (shakes && !atomic_exchange(&logged, 1)) LOG("six-axis: the game reads the controller's sensor (n=%d): %s", n, live ? "the phone's live motion" : "flat and still");
     for (int i = 0; i < n; i++) six_sample(&out[i], samp - i, shakes, live ? &mot : NULL, i);
+    // every 300 frames, while the game reads player 1's sensor: the newest sample, one line
+    static _Atomic uint64_t bucket = UINT64_MAX; uint64_t b = dm_guest_frame() / 300;
+    if (shakes && atomic_exchange(&bucket, b) != b) {
+        if (live) LOG("six-axis @frame %llu: landscape %s acc %.3f %.3f %.3f G gyro %.3f %.3f %.3f rev/s angle %.3f %.3f %.3f rev dir x(%.3f %.3f %.3f) y(%.3f %.3f %.3f) z(%.3f %.3f %.3f)",
+                      (unsigned long long)(b * 300), mot.home_right ? "right" : "left", mot.acc[0], mot.acc[1], mot.acc[2], mot.gyro[0], mot.gyro[1], mot.gyro[2], mot.angle[0], mot.angle[1], mot.angle[2],
+                      mot.dir[0], mot.dir[1], mot.dir[2], mot.dir[3], mot.dir[4], mot.dir[5], mot.dir[6], mot.dir[7], mot.dir[8]);
+        else LOG("six-axis @frame %llu: no live motion, flat and still", (unsigned long long)(b * 300));
+    }
     return n;
 }
 HLE_FORCE("_ZN2nn3hid23GetSixAxisSensorHandlesEPNS0_19SixAxisSensorHandleEiRKjNS_4util10BitFlagSetILi32ENS0_12NpadStyleTagEEE", "six-axis sensor handles: two for handheld / dual Joy-Cons, one otherwise",
