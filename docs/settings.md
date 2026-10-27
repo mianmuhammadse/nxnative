@@ -4,7 +4,7 @@ The screen before the game starts shows the settings the game supports. Tap **Pl
 
 - [Tested defaults](#tested-defaults)
 - [Game](#game): [Frame rate](#frame-rate), [Render scale](#render-scale), [Console mode](#console-mode), [Upscaling](#upscaling), [Game language](#game-language), [Frame-rate counter](#frame-rate-counter)
-- [Controls](#controls): [Touch feedback](#touch-feedback), [Game rumble](#game-rumble), [Rumble strength](#rumble-strength)
+- [Controls](#controls): [Touch feedback](#touch-feedback), [Motion controls](#motion-controls), [Game rumble](#game-rumble), [Rumble strength](#rumble-strength)
 - [Performance](#performance): [Frame buffering](#frame-buffering), [Metal 4 pipelines](#metal-4-pipelines), [Pipeline prebuild](#pipeline-prebuild), [Encode thread](#encode-thread), [Hold frames when late](#hold-frames-when-late), [Performance HUD](#performance-hud), [Reset to tested defaults](#reset-to-tested-defaults)
 - [Settings in a file](#settings-in-a-file)
 
@@ -62,6 +62,10 @@ Shows the frames per second at the top left.
 ### Touch feedback
 
 A light tap from the phone when you press an on-screen button.
+
+### Motion controls
+
+The phone is the controller's motion sensor (tilt, gyro aiming, tilt puzzles such as Breath of the Wild's tilt shrines): hold it in landscape, either way up, and tilt it as you would a Switch in handheld mode. Hold both sticks (L3 and R3) for a second to recenter the heading and zero the turn; the touch gamepad's 3D layout has both. Shaking the phone shakes the controller whether this is on or off. Off: the sensor lies flat and still. Default: on.
 
 ### Game rumble
 
@@ -188,6 +192,7 @@ A line like `DM_PRESENT_SNAP=0` in `Documents/env.txt` (in the Files app, under 
 | Game language | `DM_LANG` | a language code, such as `ja` |
 | Frame-rate counter | `DM_SHOW_FPS` | `1`, `0` |
 | Touch feedback | `DM_TOUCH_HAPTICS` | `1`, `0` |
+| Motion controls | `DM_MOTION` | `1`, `0` |
 | Game rumble | `DM_RUMBLE` | `1`, `0` |
 | Rumble strength | `DM_RUMBLE_GAIN` | `0` to `3` |
 | Upscaling | `DM_PRESENT_UPSCALE` | `off`, `metalfx` |

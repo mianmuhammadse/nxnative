@@ -18,6 +18,7 @@ DM_PRESENT_UPSCALE	choice	off=Standard,metalfx=MetalFX	off	always	Game	Upscaling
 DM_LANG	choice	languages	build:DM_LANG	languages>1	Game	Game language
 DM_SHOW_FPS	toggle	-	build:DM_SHOW_FPS	always	Game	Frame-rate counter
 DM_TOUCH_HAPTICS	toggle	-	1	always	Controls	Touch feedback
+DM_MOTION	toggle	-	1	always	Controls	Motion controls	The phone is the controller's motion sensor (tilt and gyro aiming, tilt puzzles); hold both sticks for a second to recenter. Shaking the phone works either way.
 DM_RUMBLE	toggle	-	1	always	Controls	Game rumble
 DM_RUMBLE_GAIN	range	0:3:0.1	1.0	always	Controls	Rumble strength
 DM_PRESENT_SNAP	toggle	-	DM_GAME_PRESENT_SNAP	gfxapi:nvn	Performance	Frame buffering	Up to one frame more display latency.

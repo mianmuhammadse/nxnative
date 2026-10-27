@@ -19,6 +19,8 @@
 #include <pthread.h>
 #include "dm.h"
 #include "dm_input.h"
+#include "dm_motion.h"
+#include <stdatomic.h>
 #include "front.h"
 #include "game_profile.h"
 #include "haptics_apple.h"
@@ -29,42 +31,79 @@ enum { C_NONE = 0, C_STICK, C_DPAD, C_FACE, C_BTN, C_SWAP, C_GAME };   // which 
 static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
 static uint64_t g_touch_btn, g_pad_btn, g_shake_btn;
 static int32_t g_touch_lx, g_touch_ly, g_touch_rx, g_touch_ry, g_pad_lx, g_pad_ly, g_pad_rx, g_pad_ry;
+static double g_sticks_since;   // since when L3 and R3 are both held (CACurrentMediaTime, CoreMotion's clock), 0 when not; under g_mu (Recenter, motion_start)
 static int tilted(int32_t x, int32_t y) { return (int64_t)x * x + (int64_t)y * y > (int64_t)4000 * 4000; }
 static void publish(void) {
     pthread_mutex_lock(&g_mu);
     int32_t lx = g_touch_lx, ly = g_touch_ly, rx = g_touch_rx, ry = g_touch_ry;
     if (tilted(g_pad_lx, g_pad_ly)) { lx = g_pad_lx; ly = g_pad_ly; }   // a tilted physical stick wins
     if (tilted(g_pad_rx, g_pad_ry)) { rx = g_pad_rx; ry = g_pad_ry; }
-    dm_input_set(g_touch_btn | g_pad_btn | g_shake_btn, lx, ly, rx, ry);
+    uint64_t b = g_touch_btn | g_pad_btn;
+    BOOL both = (b & (DM_BTN_LS | DM_BTN_RS)) == (DM_BTN_LS | DM_BTN_RS);
+    if (!both) g_sticks_since = 0; else if (g_sticks_since == 0) g_sticks_since = CACurrentMediaTime();   // Recenter (motion_start); same clock as CMLogItem.timestamp
+    dm_input_set(b | g_shake_btn, lx, ly, rx, ry);
     pthread_mutex_unlock(&g_mu);
 }
 
-// ---- Shaking the phone ----
-// The accelerometer at 60 Hz (no gyroscope, no permission prompt): gravity is followed by a slow low-pass (about 0.8 s), and a sample whose acceleration beyond it exceeds DM_SHAKE_G
-// (1.5 G by default; Documents/env.txt overrides) is a hit. The controller is shaken until 120 ms after the last hit: a flick is one shake (the host finishes it as a whole cycle)
-// and shaking on keeps it going. Holding the phone and pressing the screen stays far below the threshold. Each detected shake is logged with its peak
+// ---- Motion: the phone as the controller's six-axis sensor, and shaking it ----
+// CoreMotion's device motion (the fused accelerometer and gyroscope; no permission prompt) at 120 Hz, asked of the system and delivered at what the phone gives. Each sample is mapped to the
+// controller's frame by the interface orientation (both landscapes, dm_motion.h) and published with dm_motion_set: acceleration = gravity + user acceleration in G, rotation rate in
+// revolutions / s, the angle integrated from it, the direction from the attitude (reference frame: z vertical, x arbitrary). The heading starts at the first sample and again on Recenter:
+// both sticks held for a second (L3 + R3, on the touch gamepad too), which also zeroes the angle. DM_MOTION=0 (launcher: Motion controls) publishes nothing: the sensor lies flat.
+// Shaking: a sample whose user acceleration exceeds DM_SHAKE_G (1.5 G by default; Documents/env.txt overrides) is a hit. The controller is shaken until 120 ms after the last hit: a flick
+// is one shake (the host finishes it as a whole cycle) and shaking on keeps it going. Holding the phone and pressing the screen stays far below the threshold. Each detected shake is
+// logged with its peak. Shake detection works with motion controls on or off
 static CMMotionManager *g_motion;
+static _Atomic int g_home_right = 1;   // the interface is landscape right (home indicator on the right); updated on the main thread (orient_update)
+static void orient_update(UIView *v) {
+    UIInterfaceOrientation o = v.window.windowScene.interfaceOrientation;
+    if (o == UIInterfaceOrientationLandscapeRight) atomic_store(&g_home_right, 1);
+    else if (o == UIInterfaceOrientationLandscapeLeft) atomic_store(&g_home_right, 0);
+}
 static void motion_start(void) {
     if (g_motion) return;
     g_motion = [CMMotionManager new];
-    if (!g_motion.accelerometerAvailable) { LOG("front end: no accelerometer, shaking the phone does nothing"); return; }
+    if (!g_motion.deviceMotionAvailable) { LOG("front end: no device motion, the phone's motion and shaking do nothing"); return; }
     const char *e = getenv("DM_SHAKE_G"); double thr = e && atof(e) > 0 ? atof(e) : 1.5;
-    LOG("front end: shaking the phone shakes the controller (threshold %.2f G)", thr);
-    g_motion.accelerometerUpdateInterval = 1.0 / 60;
-    NSOperationQueue *q = [NSOperationQueue new]; q.maxConcurrentOperationCount = 1;
-    __block double gx = 0, gy = 0, gz = 0, last = -1, peak = 0; __block BOOL init = NO;
-    [g_motion startAccelerometerUpdatesToQueue:q withHandler:^(CMAccelerometerData *d, NSError *err) {
+    const char *mo = getenv("DM_MOTION"); BOOL live = !mo || atoi(mo);
+    LOG("front end: %s; shaking the phone shakes the controller (threshold %.2f G)", live ? "motion controls: the phone is the controller's six-axis sensor (hold both sticks 1 s to recenter)" : "motion controls off", thr);
+    g_motion.deviceMotionUpdateInterval = 1.0 / 120;
+    double *angle = calloc(3, sizeof *angle);   // the integrated turn, revolutions (lives as long as the app)
+    NSOperationQueue *q = [NSOperationQueue new]; q.maxConcurrentOperationCount = 1; q.qualityOfService = NSQualityOfServiceUserInteractive;
+    __block double last = -1, peak = 0, prev = -1, yaw0 = 0, rate_t0 = -1; __block BOOL haveYaw = NO, recentred = NO; __block int rate_n = 0;
+    [g_motion startDeviceMotionUpdatesUsingReferenceFrame:CMAttitudeReferenceFrameXArbitraryZVertical toQueue:q withHandler:^(CMDeviceMotion *d, NSError *err) {
         (void)err; if (!d) return;
-        CMAcceleration a = d.acceleration;
-        if (!init) { gx = a.x; gy = a.y; gz = a.z; init = YES; }
-        double dx = a.x - gx, dy = a.y - gy, dz = a.z - gz, g = sqrt(dx * dx + dy * dy + dz * dz);
-        gx += (a.x - gx) * 0.02; gy += (a.y - gy) * 0.02; gz += (a.z - gz) * 0.02;
+        if (rate_t0 < 0) rate_t0 = d.timestamp;
+        if (++rate_n == 240) { LOG("front end: device motion at %.0f Hz", 240 / (d.timestamp - rate_t0)); }
+        CMAcceleration u = d.userAcceleration;
+        double g = sqrt(u.x * u.x + u.y * u.y + u.z * u.z);
         if (g > thr) { if (last < 0) peak = 0; last = d.timestamp; peak = fmax(peak, g); }
         BOOL on = last >= 0 && d.timestamp - last < 0.12;
         if (!on && last >= 0) { LOG("front end: phone shaken (peak %.1f G)", peak); last = -1; }
         uint64_t want = on ? DM_BTN_SHAKE : 0;
-        pthread_mutex_lock(&g_mu); BOOL changed = g_shake_btn != want; g_shake_btn = want; pthread_mutex_unlock(&g_mu);
+        pthread_mutex_lock(&g_mu); BOOL changed = g_shake_btn != want; g_shake_btn = want; double since = g_sticks_since; pthread_mutex_unlock(&g_mu);
         if (changed) publish();
+        if (!live) return;
+        int hr = atomic_load(&g_home_right);
+        CMRotationMatrix r = d.attitude.rotationMatrix;
+        double m[9] = {r.m11, r.m12, r.m13, r.m21, r.m22, r.m23, r.m31, r.m32, r.m33};
+        BOOL held = since > 0 && d.timestamp - since >= 1.0;
+        if (!held) recentred = NO;
+        if (!haveYaw || (held && !recentred)) {
+            yaw0 = dm_motion_yaw(hr, m); angle[0] = angle[1] = angle[2] = 0;
+            if (haveYaw) LOG("front end: motion recentred");
+            haveYaw = YES; recentred = held;
+        }
+        double ga[3] = {d.gravity.x + u.x, d.gravity.y + u.y, d.gravity.z + u.z}, ro[3] = {d.rotationRate.x, d.rotationRate.y, d.rotationRate.z}, a[3], w[3];
+        dm_motion_vec(hr, ga, a); dm_motion_vec(hr, ro, w);
+        double dt = prev >= 0 ? fmin(d.timestamp - prev, 0.1) : 0; prev = d.timestamp;
+        dm_motion s;
+        for (int k = 0; k < 3; k++) {
+            s.acc[k] = (float)a[k]; s.gyro[k] = (float)(w[k] / (2 * M_PI));
+            angle[k] += w[k] / (2 * M_PI) * dt; s.angle[k] = (float)angle[k];
+        }
+        dm_motion_dir(hr, m, yaw0, s.dir);
+        dm_motion_set(&s);
     }];
 }
 
@@ -164,10 +203,13 @@ static BOOL fullOnly(int b) { return b == B_LS || b == B_RS || b >= B_LEFT; }   
         [nc addObserver:self selector:@selector(padsChanged) name:GCControllerDidConnectNotification object:nil];
         [nc addObserver:self selector:@selector(padsChanged) name:GCControllerDidDisconnectNotification object:nil];
         [self padsChanged];
+        [UIDevice.currentDevice beginGeneratingDeviceOrientationNotifications];
+        [nc addObserverForName:UIDeviceOrientationDidChangeNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *n) { (void)n; dispatch_async(dispatch_get_main_queue(), ^{ orient_update(self); }); }];
         motion_start();
     }
     return self;
 }
+- (void)didMoveToWindow { orient_update(self); }
 - (void)applyLayout {   // show / hide the controls for the current layout
     [CATransaction begin]; [CATransaction setDisableActions:YES];
     for (int b = 0; b < B_N; b++) _key[b].hidden = _tap || (fullOnly(b) && !_full);

@@ -220,7 +220,15 @@ Most service calls can be found before they crash, before the first boot or the 
 - **Cause:** the host handed out six-axis handles but reported no sensor.
 - **Fix:** it now reports one per connected controller: two for handheld or dual Joy-Cons, one otherwise, with the style, npad id and device in the handle. At rest the sensor lies flat: acceleration (0, 0, −1) G, no rotation, identity direction. Samples are 5 ms apart on the guest clock and numbered by time, so a history read returns the samples at those times. `DM_BTN_SHAKE` (`dm_input.h`: the iPhone shaken, Space on the Mac, `DM_KEYS` `Shake`) plays a side-to-side shake in whole cycles.
 - **Found on:** [Super Mario Odyssey](../../dm/games/0100000000010000/README.md): it reads all 16 history entries per sensor and ignores the count, like its npad history ([History reads fill every requested entry](#history-reads-fill-every-requested-entry)).
+- **Note:** the sensor can follow a real device instead of lying flat: [Six-axis sensor follows the phone](#six-axis-sensor-follows-the-phone).
 - **Note:** find a game's swing detector by probing the accelerometer value it reads (`DM_PROBE=main:626248@x8+10` in Odyssey 1.4.1).
+
+### Six-axis sensor follows the phone
+
+- **Symptom:** tilt and gyro play never works on the iPhone (Breath of the Wild's tilt shrines, which the paraglider needs; gyro aiming); only a shake moved the sensor.
+- **Cause:** `six_sample` always reported the sensor flat and still, and `DmGamepad.m` used the accelerometer only to detect a shake.
+- **Fix:** the front end publishes the phone's motion with `dm_motion_set` (`dm_motion.h`): CoreMotion device motion at 120 Hz, gravity + user acceleration in G, rotation rate in revolutions / s, the angle integrated from it, the direction from the attitude (reference frame z up, heading chosen at the first sample and on Recenter, both sticks held for a second). The frame is the console's held in landscape (x to the screen's right, y to its top, z out of it); `dm_motion_vec` / `dm_motion_dir` / `dm_motion_yaw` handle both landscape orientations (`tests/t_motion.c`). `hle_hid.c` answers player 1's `GetSixAxisSensorStates` with the newest sample while it is under 250 ms old (every history entry repeats it, the angle stepped back by the angular velocity), `IsSixAxisSensorAtRest` reads it too, and a detected shake still plays over it. With no sample (Mac, tests, `DM_MOTION=0`, stale) the sensor lies flat as before. The first read logs `six-axis: the game reads the controller's sensor`, and the console's own sensor (`GetSevenSixAxisSensorStates`, which the host still answers with 0 states) logs its first read too, to tell which one a game uses.
+- **Open:** axis signs and the gyro's sense were derived from the SDK's conventions and the existing flat state (gravity -z), not measured on a device; not tested on an iPhone. Whether Breath of the Wild's tilt shrines read the controller sensor or the console's (`SevenSixAxisSensor`, in handheld mode) is not established: its `main` imports both.
 
 ### SDK 20 six-axis sensor and amiibo (`nfp`) calls
 
