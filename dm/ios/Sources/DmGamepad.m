@@ -66,7 +66,8 @@ static void motion_start(void) {
     if (!g_motion.deviceMotionAvailable) { LOG("front end: no device motion, the phone's motion and shaking do nothing"); return; }
     const char *e = getenv("DM_SHAKE_G"); double thr = e && atof(e) > 0 ? atof(e) : 1.5;
     const char *mo = getenv("DM_MOTION"); BOOL live = !mo || atoi(mo);
-    LOG("front end: %s; shaking the phone shakes the controller (threshold %.2f G)", live ? "motion controls: the phone is the controller's six-axis sensor (hold both sticks 1 s to recenter)" : "motion controls off", thr);
+    int flip = dm_motion_flip_parse(getenv("DM_MOTION_FLIP"));   // axis sign correction, see dm_motion.h
+    LOG("front end: %s (axis flip %s); shaking the phone shakes the controller (threshold %.2f G)", live ? "motion controls: the phone is the controller's six-axis sensor (hold both sticks 1 s to recenter)" : "motion controls off", dm_motion_flip_name(flip), thr);
     g_motion.deviceMotionUpdateInterval = 1.0 / 120;
     double *angle = calloc(3, sizeof *angle);   // the integrated turn, revolutions (lives as long as the app)
     NSOperationQueue *q = [NSOperationQueue new]; q.maxConcurrentOperationCount = 1; q.qualityOfService = NSQualityOfServiceUserInteractive;
@@ -95,14 +96,14 @@ static void motion_start(void) {
             haveYaw = YES; recentred = held;
         }
         double ga[3] = {d.gravity.x + u.x, d.gravity.y + u.y, d.gravity.z + u.z}, ro[3] = {d.rotationRate.x, d.rotationRate.y, d.rotationRate.z}, a[3], w[3];
-        dm_motion_vec(hr, ga, a); dm_motion_vec(hr, ro, w);
+        dm_motion_vec(hr, flip, ga, a); dm_motion_vec(hr, flip, ro, w);
         double dt = prev >= 0 ? fmin(d.timestamp - prev, 0.1) : 0; prev = d.timestamp;
         dm_motion s; s.home_right = hr;
         for (int k = 0; k < 3; k++) {
             s.acc[k] = (float)a[k]; s.gyro[k] = (float)(w[k] / (2 * M_PI));
             angle[k] += w[k] / (2 * M_PI) * dt; s.angle[k] = (float)angle[k];
         }
-        dm_motion_dir(hr, m, yaw0, s.dir);
+        dm_motion_dir(hr, flip, m, yaw0, s.dir);
         dm_motion_set(&s);
     }];
 }
