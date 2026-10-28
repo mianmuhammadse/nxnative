@@ -48,7 +48,7 @@ static void publish(void) {
 // ---- Motion: the phone as the controller's six-axis sensor, and shaking it ----
 // CoreMotion's device motion (the fused accelerometer and gyroscope; no permission prompt) at 120 Hz, asked of the system and delivered at what the phone gives. Each sample is mapped to the
 // controller's frame by the interface orientation (both landscapes, dm_motion.h) and published with dm_motion_set: acceleration = gravity + user acceleration in G, rotation rate in
-// revolutions / s, the angle integrated from it, the direction from the attitude (reference frame: z vertical, x arbitrary). The heading starts at the first sample and again on Recenter:
+// revolutions / s, the angle integrated from it, the direction from the attitude (z vertical, x arbitrary; magnetometer-corrected yaw when available, to limit long-session drift). The heading starts at the first sample and again on Recenter:
 // both sticks held for a second (L3 + R3, on the touch gamepad too), which also zeroes the angle. DM_MOTION=0 (launcher: Motion controls) publishes nothing: the sensor lies flat.
 // Shaking: a sample whose user acceleration exceeds DM_SHAKE_G (1.5 G by default; Documents/env.txt overrides) is a hit. The controller is shaken until 120 ms after the last hit: a flick
 // is one shake (the host finishes it as a whole cycle) and shaking on keeps it going. Holding the phone and pressing the screen stays far below the threshold. Each detected shake is
@@ -67,12 +67,14 @@ static void motion_start(void) {
     const char *e = getenv("DM_SHAKE_G"); double thr = e && atof(e) > 0 ? atof(e) : 1.5;
     const char *mo = getenv("DM_MOTION"); BOOL live = !mo || atoi(mo);
     int flip = dm_motion_flip_parse(getenv("DM_MOTION_FLIP"));   // axis sign correction, see dm_motion.h
-    LOG("front end: %s (axis flip %s); shaking the phone shakes the controller (threshold %.2f G)", live ? "motion controls: the phone is the controller's six-axis sensor (hold both sticks 1 s to recenter)" : "motion controls off", dm_motion_flip_name(flip), thr);
+    CMAttitudeReferenceFrame frame = ([CMMotionManager availableAttitudeReferenceFrames] & CMAttitudeReferenceFrameXArbitraryCorrectedZVertical)
+        ? CMAttitudeReferenceFrameXArbitraryCorrectedZVertical : CMAttitudeReferenceFrameXArbitraryZVertical;
+    LOG("front end: %s (axis flip %s, reference frame %s); shaking the phone shakes the controller (threshold %.2f G)", live ? "motion controls: the phone is the controller's six-axis sensor (hold both sticks 1 s to recenter)" : "motion controls off", dm_motion_flip_name(flip), frame == CMAttitudeReferenceFrameXArbitraryCorrectedZVertical ? "xArbitraryCorrectedZVertical" : "xArbitraryZVertical", thr);
     g_motion.deviceMotionUpdateInterval = 1.0 / 120;
     double *angle = calloc(3, sizeof *angle);   // the integrated turn, revolutions (lives as long as the app)
     NSOperationQueue *q = [NSOperationQueue new]; q.maxConcurrentOperationCount = 1; q.qualityOfService = NSQualityOfServiceUserInteractive;
     __block double last = -1, peak = 0, prev = -1, yaw0 = 0, rate_t0 = -1; __block BOOL haveYaw = NO, recentred = NO; __block int rate_n = 0;
-    [g_motion startDeviceMotionUpdatesUsingReferenceFrame:CMAttitudeReferenceFrameXArbitraryZVertical toQueue:q withHandler:^(CMDeviceMotion *d, NSError *err) {
+    [g_motion startDeviceMotionUpdatesUsingReferenceFrame:frame toQueue:q withHandler:^(CMDeviceMotion *d, NSError *err) {
         (void)err; if (!d) return;
         if (rate_t0 < 0) rate_t0 = d.timestamp;
         if (++rate_n == 240) { LOG("front end: device motion at %.0f Hz", 240 / (d.timestamp - rate_t0)); }
