@@ -61,7 +61,7 @@ Controls, saves and settings: [Playing](docs/playing.md).
 
 Games tested on Mac or iPhone. See the [per-game notes](dm/games/README.md#games) for tested platforms, progress and known issues:
 
-Needs iOS / iPadOS 26 or later on an iPhone 15 Pro or newer (A17 Pro chip or later) or an iPad with an M1 chip or later: the games' textures are BC-compressed, and older iPhones can't read that format. Other games aren't supported yet. For them the script writes a survey and still tries its best to pack an IPA, guessing the game's settings; such an IPA may not start.
+Needs iOS / iPadOS 26 or later. This fork also runs tested NVN games (Metroid Dread and Breath of the Wild) on the non-Pro iPhone 15 (A16), converting BC textures at runtime; Breath of the Wild needs the Increased Memory Limit entitlement. Vulkan and OpenGL games still require a GPU with BC support. Other games aren't supported yet. For them the script writes a survey and still tries its best to pack an IPA, guessing the game's settings; such an IPA may not start.
 **Shaking.** Shake the iPhone to shake the controller, in games that read its motion: Super Mario Odyssey's motion moves (such as the cap throw on a shake) need it, and Odyssey only takes them in its default docked mode. A light bump does not count; a sharp flick of the phone does.
 
 Under a game, "60 fps with 1.2.0" means it runs at 60 fps (30 on the Switch) with that update.

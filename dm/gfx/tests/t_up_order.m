@@ -11,7 +11,7 @@ uint64_t g_t0_ns;
 int dm_guest_as_contains(uintptr_t address) { (void)address; return 0; }
 void *front_metal_layer(void) { return NULL; }
 module_t *module_of(const void *p) { (void)p; return NULL; }
-module_t g_mod[MAX_MOD]; int g_nmod;
+module_t *g_mod; int g_nmod;
 void svc_thread_dump(void) {}
 uint64_t now_ns(void) { return bp_now(); }
 
@@ -37,6 +37,13 @@ static void read_back(id<MTLTexture> t, uint8_t out[64]) {   // 2x2 ASTC blocks 
 int main(void) {
     setenv("DM_TEST_NO_BC", "1", 1);
     mtl_init(); mtl_sub_begin();
+    {   // BC3 and ASTC both have 16-byte blocks: a byte-size check alone must not permit a native-BC storage mirror.
+        tex_t desc = {0}; desc.d.format = 0x44; desc.d.width = desc.d.height = 8;
+        NVNcopyRegion region = {0}; region.width = region.height = 8; region.depth = 1;
+        id<MTLTexture> t = new_astc(); int before = g_npost;
+        mirror_readback(&desc, t, 0, 0, &region, "texture", 0);
+        CHECK(g_npost == before, "ASTC blocks were queued for readback into BC3 storage");
+    }
     // four BC3 blocks with varying alpha, and what they transcode to
     uint8_t bc[4][16], want[64]; uint32_t s = 12345;
     for (int b = 0; b < 4; b++) { for (int i = 0; i < 16; i++) { s = s * 1664525u + 1013904223u; bc[b][i] = (uint8_t)(s >> 24); } nvn_bc2astc_block(3, bc[b], want + b * 16); }
