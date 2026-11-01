@@ -196,6 +196,8 @@ Before publishing, the fixes were integrated with main's pipeline archive and GP
 
 ## Found on this game
 
+- [Restored phone motion](../../../docs/reference/services.md#coremotion-attitude-restored-for-phone-aiming-in-this-fork): CoreMotion attitude, axis flips and recenter restored from the motion branch; bow aiming and long-session drift still need device validation.
+
 - [Pressure trim lock type](../../../docs/reference/memory.md#pressure-trim-uses-the-texture-registrys-lock-type): resolved in this fork by matching the registry unfair-lock API; device pressure-path validation remains open.
 
 - **Resolved, parallel rewriting (2026-10-31):** [Parallel scans preserve rewrite output](../../../docs/reference/rewriter.md#parallel-scans-preserve-rewrite-output). All 21 binary and TSV outputs of the three modules of v1114112 are byte-identical to the sequential rewriter. The full regression against `635e8008` passed: zero red diagnostics, matching screenshots, and no frame-time or memory regression (M4 Pro, Xcode 27.2 with the per-run compiler override on both revisions).

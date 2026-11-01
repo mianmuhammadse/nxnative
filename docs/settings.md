@@ -240,3 +240,5 @@ A line like `DM_PRESENT_SNAP=0` in `Documents/env.txt` (in the Files app, under 
 | Performance HUD | `DM_METAL_HUD` | `1`, `0` |
 
 `DM_LAUNCHER=0` skips the settings screen; the choices you saved there still apply. `DM_SAVED_CHOICES=0` starts with the tested defaults and keeps your saved choices for later. How the settings are listed for each game: [dm/games/settings.tsv](../dm/games/settings.tsv).
+
+On iOS, **Motion controls** enables phone tilt and gyro aiming. Hold L3 and R3 for one second to recenter. `DM_PHONE_MOTION=1` in Documents/env.txt selects phone motion even with a controller connected; BotW must also have its own Motion Controls option enabled.

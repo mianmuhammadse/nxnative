@@ -484,6 +484,28 @@ static void t_motion_hid(void) {
     dm_pad_players(1); g_phone_mode = -1;
 }
 
+// A fused phone sample must reach the SDK unchanged, including its corrected attitude.
+static void t_phone_attitude(void) {
+    g_mode = 1; dm_pad_players(1); g_phone_mode = 1;
+    dm_motion m = {.acc = {0.25f, -0.5f, -0.75f}, .gyro = {0, 0, 0.5f}, .angle = {0, 0, 0.1f},
+                   .dir = {0, 1, 0, -1, 0, 0, 0, 0, 1}};
+    dm_phone_motion_set(&m);
+    uint32_t h, id = 0; SixAxisState st;
+    h_hid_SixHandles(&h, 1, &id, STYLE_FULLKEY);
+    h_hid_SixStates(&st, 1, &h);
+    CHECK(st.acc[0] == m.acc[0] && st.gyro[2] == m.gyro[2], "phone acceleration and gyro preserve mapped units");
+    CHECK(st.dir[1] == 1 && st.dir[3] == -1 && st.angle[2] == m.angle[2], "CoreMotion attitude and integrated angle reach SDK without raw-gyro reintegration");
+    motion_now += MOTION_STALE_NS + 1;
+    h_hid_SixStates(&st, 1, &h);
+    CHECK(st.acc[2] == -1 && st.gyro[2] == 0, "stale fused phone sample falls back to flat");
+    dm_phone_motion_set(&m); dm_phone_motion_set(NULL);
+    h_hid_SixStates(&st, 1, &h);
+    CHECK(st.acc[2] == -1 && st.gyro[2] == 0, "withdrawn phone sample is unavailable");
+    dm_phone_motion_set(&m); g_phone_mode = 0;
+    CHECK(!motion_live(0, &(motion_state){0}), "phone mode off ignores fused attitude");
+    dm_phone_motion_set(NULL); g_phone_mode = -1;
+}
+
 int main(void) {
     CHECK(setenv("DM_RUMBLE_LOG", "1", 1) == 0, "enable rumble diagnostics");
     t_slots();
@@ -493,6 +515,7 @@ int main(void) {
     t_rumble_log();
     t_motion_threads();
     t_motion_live();
+    t_phone_attitude();
     t_motion_hid();
     t_rec();
     printf("hid players: %d checks, %d failed\n", checks, fails);
