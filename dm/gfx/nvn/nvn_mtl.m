@@ -11101,7 +11101,7 @@ static void mem_trim_if_requested(void) {
     pthread_mutex_unlock(&g_smu);
     o += snprintf(out + o, sizeof out - o, "ghost table %u -> %u entries (%u dropped, %llu MB of their own, %u over pool buffers), spare textures %u (%llu MB)", before, before - gn, gn, (unsigned long long)(gb >> 20), g_ghost_bufbacked, spn, (unsigned long long)(spb >> 20));
     // view cache
-    pthread_mutex_lock(&g_rmu); ovn = g_vc.n; nvn_hm_clear(&g_vc, vc_set_free); pthread_mutex_unlock(&g_rmu);
+    os_unfair_lock_lock(&g_rmu); ovn = g_vc.n; nvn_hm_clear(&g_vc, vc_set_free); os_unfair_lock_unlock(&g_rmu);
     o += snprintf(out + o, sizeof out - o, ", view cache %u entries", ovn);
     {   // shared textures nothing resolves to any more (the ghost entries just dropped among them: the sharing table holds them as long as it does) and that were not looked up for 64 (tier 1) / 16 (tier 2) submissions
         pthread_mutex_lock(&g_smu); uint64_t idle = tier >= 2 ? 16 : 64;

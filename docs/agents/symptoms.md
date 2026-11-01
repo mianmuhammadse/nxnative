@@ -109,6 +109,7 @@ One line per symptom in the [subsystem references](../reference/): what you see 
 - travelling produces a brief multi-GB footprint spike, then memory returns to its earlier level; periodic memory lines can miss the peak. Upload diagnostics show many swapped-out blocks still alive in one batch. → [Upload staging grows within one rendering submission](../reference/memory.md#upload-staging-grows-within-one-rendering-submission)
 - GPU memory grows with repeated `nvnTextureReadTexels` calls on a long-lived game thread, even after each readback completes. → [GPU readback without an autorelease pool](../reference/memory.md#gpu-readback-without-an-autorelease-pool)
 - process footprint and Metal allocation grow during stationary gameplay even after readback fences complete; the deferred-release queue and command allocator sizes remain bounded. → [Completion readbacks survive a guest waiter's pool](../reference/memory.md#completion-readbacks-survive-a-guest-waiters-pool)
+- this fork's pressure-trim view-cache purge produces incompatible-pointer warnings for `pthread_mutex_lock` / `pthread_mutex_unlock`; the emergency path can corrupt lock storage or fail to synchronize. → [Pressure trim uses the texture registry's lock type](../reference/memory.md#pressure-trim-uses-the-texture-registrys-lock-type)
 
 ## Threads
 

@@ -196,6 +196,8 @@ Before publishing, the fixes were integrated with main's pipeline archive and GP
 
 ## Found on this game
 
+- [Pressure trim lock type](../../../docs/reference/memory.md#pressure-trim-uses-the-texture-registrys-lock-type): resolved in this fork by matching the registry unfair-lock API; device pressure-path validation remains open.
+
 - **Resolved, parallel rewriting (2026-10-31):** [Parallel scans preserve rewrite output](../../../docs/reference/rewriter.md#parallel-scans-preserve-rewrite-output). All 21 binary and TSV outputs of the three modules of v1114112 are byte-identical to the sequential rewriter. The full regression against `635e8008` passed: zero red diagnostics, matching screenshots, and no frame-time or memory regression (M4 Pro, Xcode 27.2 with the per-run compiler override on both revisions).
 - [Benchmark captures perturb the measured frame pacing](../../../docs/reference/frame-rate.md#benchmark-captures-perturb-the-measured-frame-pacing).
 - **Resolved, two stale chain folders held 4.4 GB:** [Old shader library folders grew a game's build folder with each chain change](../../../docs/reference/shaders.md#old-shader-library-folders-grew-a-games-build-folder-with-each-chain-change).

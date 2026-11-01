@@ -389,3 +389,10 @@ The guest address space, heaps, pools, virtual address memory and the allocators
 - **Check:** `make -C dm/gfx/tests GAME=<id> check_t_readback` gates real GPU feedback and exercises both `DM_NVN_FAST_WAKE=1` guest-owned completion and `0` callback-owned completion. It checks literal mirrored pixels and event visibility, delayed-feedback idempotence, then weak readback-buffer destruction after real retirement while the guest outer pool remains open. The lifetime assertion fails without the local pool and passes with it.
 - **Found on:** [Tears of the Kingdom](../../dm/games/0100F2C0115B6000/README.md#memory), M2 Pro stationary cave route. A bounded paired diagnostic on chain `d1043b780a74` showed footprint growth of 617 MiB over about 86 seconds without the pool versus 1 MiB over about 83 seconds with it. This is route-local memory evidence, not an FPS improvement, complete allocation census or verified fix for an iPhone termination.
 
+### Pressure trim uses the texture registry's lock type
+
+- **Symptom:** this fork's pressure-trim view-cache purge produces incompatible-pointer warnings for `pthread_mutex_lock` / `pthread_mutex_unlock`; the emergency path can corrupt lock storage or fail to synchronize.
+- **Cause:** `g_rmu` is an `os_unfair_lock`, as used by the texture registry and normal view-cache operations, but the fork's trim path passed its address to the pthread mutex API. The two lock representations are incompatible.
+- **Fix:** use `os_unfair_lock_lock` / `os_unfair_lock_unlock` around the trim's `g_vc` purge, matching every other registry caller. The storage lock `g_smu` is released before taking `g_rmu`; trim thresholds and eviction policy are unchanged.
+- **Check:** source audit confirms all `g_rmu` lock operations use the unfair-lock API. Host/iOS compilation and on-device pressure-triggered execution remain pending user validation.
+- **Found on:** [Breath of the Wild](../../dm/games/01007EF00011E000/README.md#found-on-this-game), review of this fork's A16 memory-pressure path.
