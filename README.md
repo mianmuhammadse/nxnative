@@ -17,9 +17,9 @@ Community projects build on nxnative with Mac apps that turn your games into app
 
 ### Build from the command line
 
-You need a Mac with macOS 26.6 or later, [Xcode](https://developer.apple.com/download/all/?q=Xcode%2027.1) 27.1, [Homebrew](https://brew.sh) and Python 3.12 or newer (an arm64 one, not an Intel Homebrew's). An iPhone build also needs Xcode's iOS platform (Xcode → Settings → Components).
+You need a Mac with macOS 26.6 or later, [Xcode](https://developer.apple.com/download/all/?q=Xcode%2027.2) 27.2, [Homebrew](https://brew.sh) and Python 3.12 or newer (an arm64 one, not an Intel Homebrew's). An iPhone build also needs Xcode's iOS platform (Xcode → Settings → Components).
 
-The shaders are built with Xcode 27.1's Metal compiler, so take 27.1 from Apple's download page, not the App Store's newer Xcode. With a newer Xcode installed too, rename 27.1 to `Xcode-27.1.app` and select it before step 1: `sudo xcode-select -s /Applications/Xcode-27.1.app`.
+The shaders are built with Xcode 27.2's Metal compiler. Select it before step 1: `sudo xcode-select -s /Applications/Xcode.app`. With several Xcode versions installed, name this one `Xcode-27.2.app` and select it with `sudo xcode-select -s /Applications/Xcode-27.2.app`.
 
 **1. Install the tools** (only once), in Terminal:
 
@@ -260,7 +260,7 @@ Under a game, "60 fps with 1.2.0" means it runs at 60 fps (30 on the Switch) wit
 </tr>
 <tr>
 <td align="center" valign="top" width="33%"><img src="docs/images/metroid-prime-remastered.jpg" width="256" alt="Metroid Prime Remastered"><br><small><b><a href="dm/games/010012101468C000/README.md">Metroid Prime Remastered</a></b></small></td>
-<td></td>
+<td align="center" valign="top" width="33%"><img src="docs/images/dragon-quest-i-ii-hd-2d-remake.jpg" width="256" alt="DRAGON QUEST I &amp; II HD-2D Remake"><br><small><b><a href="dm/games/0100D7C01F254000/README.md">DRAGON QUEST I &amp; II HD-2D Remake</a></b></small></td>
 <td></td>
 </tr>
 </table>
