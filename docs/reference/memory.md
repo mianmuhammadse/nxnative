@@ -92,6 +92,13 @@ The guest address space, heaps, pools, virtual address memory and the allocators
 - **Fix:** [`dm/gfx/hle_nv.c`](../../dm/gfx/hle_nv.c) answers the five `nv::` symbols such a game imports: it records the allocator callbacks (`SetGraphicsAllocator`, `SetGraphicsDevtoolsAllocator`) and the pool from `InitializeGraphics(void*, size_t)`, and `GetGraphicsMemoryInfo` reports that pool (total and free = its size) or zeroes the structure when nothing was initialised. It writes the record of the game's SDK: 0x20 bytes when `DM_SDK_OLD(dm_sdk_major())`, 0x40 otherwise (the boundary the NVN API version and the shared-font layout follow too); the pool figures lie in the first four counters, so both sizes carry them.
 - **Found on:** [Well Dweller](../../dm/games/0100217023F6C000/README.md) (SDK 22.2.0, GameMaker Studio 2, OpenGL through EGL). The game's allocator is never called again, so a zeroed report is equally correct on a GL-only title. The 32-byte overrun on old SDKs was found on Hyrule Warriors: Definitive Edition 1.0.1 (SDK 3.5.1, KTGL, NVN; GitHub issue #708, [PR #709](https://github.com/seedds/nxnative/pull/709)): its startup caller passes a 32-byte record, and AddressSanitizer reported the write past it.
 
+### An SDK 21 Switch 2 game with a 4.5 GB alias region
+
+- **Symptom:** a null pointer in the game's resource code (`main+0x15a69b0`, null + 0x78, thread `BaseProcCreateAndDeleteThread`): a model's load returned null, its status 9, written hundreds of times by a loader thread. The `[mem]` lines end near the top of the alias region.
+- **Cause:** the alias region ran out. An SDK 21 game keeps the SDK's 1 GB node area, as the sdk patches that cut it do not match this SDK, and maps past 4.25 GB of it at the first level.
+- **Fix:** the profile's `mem_alias`: 16 GB ([Splatoon Raiders](../../dm/games/0400380020056000/README.md): `0x400000000`, with `mem_reserve 0x550000000`). The peak then is about +8.5 GB.
+- **Found on:** [Splatoon Raiders](../../dm/games/0400380020056000/README.md). [Fire Emblem Fortune's Weave](../../dm/games/04007EF01F8AE000/README.md) (SDK 22.2.0) takes the same split, and its SDK has its node-area cut (`dm/tools/sdk_patches.py`), from 1 GB to 62 MB, because `alias_room` aborted in `StandardAllocator::Initialize` without one. **Open:** 16 GB is over iOS's reservation limit, so an IPA needs the SDK 21 node-area and alignment cuts first.
+
 ## Virtual address memory and the alias region
 
 ### Virtual address memory follows the NPDM's system resource
@@ -191,6 +198,13 @@ The guest address space, heaps, pools, virtual address memory and the allocators
 - **Commits:** probe `VammManager::AllocateMemoryPages` / `FreeMemoryPages` (x1 address, x2 size) and split them by region. On DRAGON QUEST VII Reimagined, `nn::os::AllocateMemoryPages` was probed past its `adrp` (`sdk+0x140f84`).
 - **Windows:** `DM_ALIAS_WINDOWS=<window MB>` (for example `DM_ALIAS_WINDOWS=512`) logs, every 30 s, the mapped memory of each window of that size in the alias region (`hle_svc.c`); it measured Octopath Traveler 0's allocator pools and Super Smash Bros. Ultimate's battle commits.
 - **Log:** the `[mem]` lines report the alias high-water mark (one line per 256 MB), the total actually mapped (page bitmap) and every heap growth.
+
+### An alias high-water mark near the top is not exhaustion
+
+- **Symptom:** the `[mem]` high-water mark climbs close to the end of the alias region while far less is mapped (SUPER ROBOT WARS Y: +4.27 GB of 4.38 GB with 1.82 GB of live regions), and it looks like the address space is about to run out.
+- **Cause:** none to fix: this is how `VammManager::AllocateAddressRegion` places regions. It walks its tree from the highest region down, takes the first hole that fits and places the region at that hole's low end (read on SDK 18.3.5, `sdk+0x13bfd0`; other implementations not read). So while the top has room, every new region lands just past the highest one and freed holes below stay idle, and the mark rises with address churn, not with use. Only when no hole fits does the function return its failure (`w0 = 2` at `sdk+0x13c11c`).
+- **Fix:** none. To judge the room left, read the live regions and their holes in the `DM_REGIONS` table, not the mark, or run with a smaller alias region (`DM_ALIAS_SIZE`): if the game goes on with the end of the table pinned at the top, the holes are serving it. A real exhaustion is what [Size-aligned regions exhaust the alias address space](#size-aligned-regions-exhaust-the-alias-address-space) and [Size-class alignment doubles Unity's regions](#size-class-alignment-doubles-unitys-regions) describe: a request no hole fits.
+- **Found on:** [SUPER ROBOT WARS Y](../../dm/games/010063301BD50000/README.md#memory): every one of 228 regions placed above the top skipped a hole that would have held it, and with the alias region cut to 3 GB the end stayed at +2.99 GB for about 10 minutes of battle demos with no failure.
 
 ## Engine allocators
 
