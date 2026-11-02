@@ -77,6 +77,8 @@ DM_MEASURE_LOCK	path	`=<file>`: `scripts/regress.py`'s default `--lock`, the mea
 DM_MEMSTAT	diagnostic	`=<tsv>` writes one line per second of memory accounting: footprint, Metal allocation and resident and charged memory by region class (guest, code, malloc, gpu, …)
 DM_MEMSTAT_DUMP	diagnostic	`=<seconds>`: with `DM_MEMSTAT`, at that second writes every VM region of 1 MiB or more to `<tsv>.regions`
 DM_MEM_CAP_GB	switch	`=<GB>`: the memory watchdog exits when resident memory exceeds that many GB (default 24 on the Mac, none on iOS; `0` turns it off)
+DM_MEM_HEADROOM	diagnostic	`=<MB>` stands in for the headroom to the process memory limit that the memory-pressure response reads (on iOS `os_proc_available_memory()`, unknown elsewhere): under 300 MB asks for tier 1, under 150 MB for tier 2; sampled every 30 frames. Tests the response on the Mac
+DM_MEM_TRIM	diagnostic	`=<frame>:<tier>,…` asks for the memory-pressure trim of that tier (1 or 2) once the game reaches that frame, in the order given, and logs `memory pressure: tier N (test switch …)`; tests the response on the Mac
 DM_METAL_CAPTURE	diagnostic	`=1` makes `build_ipa.sh` produce a build that can write GPU frame captures (`MetalCaptureEnabled` in `Info.plist`), for `DM_GPU_CAPTURE`
 DM_METAL_HUD	player	`1` shows Apple's Metal performance HUD over the game (frame rate, frame and GPU time, memory)
 DM_MOTION	switch	`0` ignores live motion: every six-axis sensor lies flat as before (a shake still plays), and neither controllers' motion sensors nor the phone's device motion are switched on (`hle_hid.c`, `motion_apple.h`, `DmGamepad.m`); the NSP script's `--no-motion` (`MOTION = False`) builds it in
@@ -89,6 +91,10 @@ DM_MOTION_LOG	diagnostic	`=1` logs player 1's mapped motion sample once a second
 DM_MOVIE_TRACE	diagnostic	When set, the movie decoder logs every call with its thread and decoder (by default the first 12 calls, then every 2^k-th)
 DM_MSL_DIR	path	Parent folder of the shader libraries: NVN loads from `b-<chain version>/` beneath it, Vulkan from `vk/`, GL from `gl/`; the app and the Mac launcher set it
 DM_NICK	switch	The account nickname the game sees (default `Player`)
+DM_NO_BC_ASTC	switch	`=all|bc1|0` on a GPU without BC texture compression: which BC formats are stored as ASTC 4x4 (`all`, the default, is BC1, BC2 and BC3; `bc1` only BC1; `0` decompresses every BC format to RGBA8, the reference for A/B comparisons); BC4, BC5, BC6H, BC7 and 3D textures are decompressed in every mode
+DM_NO_BC_ASTC_KEEP	switch	`=0` without BC: ignores the profile's `bc3_keep_rgba8.tsv`, so the BC3 textures it lists are stored as ASTC too (for A/B comparisons); any other value keeps the list
+DM_NO_BC_ASTC_KEEP_TABLE	path	`=<file>` without BC: reads the BC3 keep table (textures that stay RGBA8) from that file instead of `bc3_keep_rgba8.tsv` beside the profile's other tables
+DM_NO_BC_ASTC_KEYLOG	diagnostic	Set to any value, without BC: logs every packaged BC3 texture lookup in the keep table (key, format, storage size, first bytes, hit), to build or check `bc3_keep_rgba8.tsv`
 DM_NRO	switch	`0` turns off loading of the NRO modules the game's NRR files register (on by default): every `nn::ro::LoadModule` then fails
 DM_NVN_ALLOCPROF	diagnostic	`=1` charges Metal allocation growth to each replayed op type and function, and logs command allocator sizes and each new texture (serial, size, format, storage)
 DM_NVN_API	switch	`=<major>.<minor>` overrides the NVN API version `nvnDeviceGetInteger` reports (by default decided by the SDK version or the profile's `device_api`: 55.15 for SDK 11 and later, 53.313 before)
@@ -301,6 +307,7 @@ DM_TEST_KEYRACE	diagnostic	`=<n>` creates up to n (at most 512) pthread keys on 
 DM_TEST_KILL_AT	diagnostic	`=write:<n>` exits the process (`_exit(9)`) at the nth save write, imitating a kill mid-write
 DM_TEST_LEAK_GPU	diagnostic	`=1` allocates and keeps a 1 MB shared Metal buffer every 100 ticks: a GPU memory leak on demand
 DM_TEST_LINK_STALL	diagnostic	`=<start s>,<duration s>`: counting from the first present, pauses the display link at that point for that long, to check the present fallback
+DM_TEST_NO_BC	diagnostic	`=1` makes the host treat the GPU as one without BC texture compression, as an A15 or A16 iPhone: BC1 to BC3 stored as ASTC 4x4, the other BC formats decompressed. Tests the path on a Mac; `0` or empty leaves the choice to the GPU
 DM_TEST_NO_METAL4	diagnostic	`=1` treats the GPU as one without Metal 4, as on a virtual Mac: the NVN layer starts only its classic part and drops every present
 DM_TEST_PRESENT_LAG	diagnostic	`=<every n>,<ms>[,<in a row>][;…]` sleeps that long before every nth present (and the ones after it in the run): a slow frame on demand
 DM_TEST_SWKBD_HOLD_MS	diagnostic	`=<ms>` (with `DM_KBD`) keeps the system keyboard up that long before `DM_KBD`'s text is returned, as a player typing would
