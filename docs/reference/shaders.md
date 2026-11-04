@@ -19,6 +19,14 @@ Finding, keying and translating shaders (`dm/gfx/tools/shader_split.py`, `dmsh_b
 - **Found on:** [FINAL FANTASY X/X-2 HD Remaster](../../dm/games/0100BC300CB48000/README.md); base and both supplied DLC packs yield 5,752 unique shaders.
 - **Check:** `test_vbf.py` covers raw and zlib blocks, shared/missing members, truncation, unaligned effects, loose shader keys and inconsistent lengths. All 5,752 programs translate on the Mac.
 
+### Phyre NVN effects in Coldwood kit archives
+
+- **Symptom:** the NSP script stops with "the shader split found no shaders in main or the RomFS" for a PhyreEngine game whose RomFS is a `.kit` file and numbered `.kit.0`, `.kit.1`, … chunks.
+- **Cause:** the kit index (`kit!` … `!tik`) lists each file by name hash, flags, chunk, offset, stored size, size and SHA-1, with no names. Most files are LZ4 blocks of at most 64 KB, each with a u32 length and allowed to refer to the 64 KB before it in the same file, so a chunk read as one stream loses its place at the first stored file. The shader split read neither.
+- **Fix:** `kit.py` reads the index and decodes each member from its chunk, checked against its size and SHA-1; the split passes the `RYHP` members to `phyre_shaders` and skips the chunks as files of their own. Phyre's compute shaders precede their control sections too, but with no code header: `phyre_shaders` takes them by the control's thread group, as `glslc_stage` does. Without them the GPU particle dispatches logged "the dispatched program has no compute shader".
+- **Found on:** Unravel Two 1.0.1 (`0100E5D00CC0C000`, no profile yet): 22,268 members in 12 chunks; its 2,629 unique programs (438 vertex, 1,793 pixel, 398 compute) are all in `Data.kit.0`.
+- **Check:** `test_kit.py` covers linked and stored members, a SHA-1 mismatch, a short index, and the split reading an effect member while skipping its chunk; `test_vbf.py` covers a headerless compute program.
+
 ### A file no reader reads
 
 - **Symptom:** the shader split stops on one archive with a Python traceback (an `IndexError` or `struct.error` naming no file), or a reader's `[RED]` line about a format it does not know, and nothing is written; the NSP script loses the build at the split.

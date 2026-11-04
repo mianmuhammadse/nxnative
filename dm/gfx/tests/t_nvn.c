@@ -202,6 +202,15 @@ int main(void) {
         EXPECT("GPU-only retargeted size", 0x80, P(nvnBufferGetSize)(buffer));
         EXPECT("GPU-only buffer stays unmappable", 0, (uintptr_t)P(nvnBufferMap)(buffer));
         P(nvnBufferFinalize)(buffer); P(nvnMemoryPoolFinalize)(&private_pool);
+
+        // A view the game writes into an NVNbuffer slot with no Initialize (Unravel Two, SDK 6.4): {u64 GPU address, u32 size}, the size's upper word left as it was
+        NVNbuffer view; memset(&view, 0xa5, sizeof view);
+        uint64_t vaddr = (uintptr_t)poolmem + 0x640; uint32_t vsize = 0x20;
+        memcpy(&view, &vaddr, 8); memcpy((uint8_t *)&view + 8, &vsize, 4);
+        EXPECT("game-written view address", (uintptr_t)poolmem + 0x640, P(nvnBufferGetAddress)(&view));
+        EXPECT("game-written view size", 0x20, P(nvnBufferGetSize)(&view));
+        EXPECT("game-written view map", (uintptr_t)poolmem + 0x640, (uintptr_t)P(nvnBufferMap)(&view));
+        EXPECT("game-written view has no pool", 0, (uintptr_t)P(nvnBufferGetMemoryPool)(&view));
     }
 
     // 4. Texture storage size (block-linear: GOB = 64 B × 8 rows; block height from the GOB count of "height × 1.5": ≥16→16, ≥8→8 ...)

@@ -35,6 +35,14 @@ The game may also write into an NVN object directly, without an NVN call, throug
 - **Found on:** [LEGO Star Wars: The Skywalker Saga, issue #723](https://github.com/seedds/nxnative/issues/723), 1.10.0, SDK 12.3.6, main build `ec593a5f9552100a9fe95c4ca9e34873` (reporter's trace). This is a general object ABI correction; no game profile is needed.
 - **Check:** `t_nvn.c` initializes a buffer through the public API, retargets it repeatedly with raw byte writes, and checks address, size, mapping, pool and offset queries, builder independence and neighbouring-object guards. It also retargets a CPU-inaccessible buffer. Validation uses synthetic memory only; the reported game's rendering has not been retested.
 
+### A buffer view the game writes into an `NVNbuffer` slot
+
+- **Symptom:** `CRASH sig=11 addr=0x28 pc=h_nvnBufferGetAddress+0x4` (or the address a few bytes past a word of text, such as `0x756e654d00000028`) at a level's first indirect dispatch, with the buffer's first two words a GPU address and a small size (`0x39a1f2640 0x20`).
+- **Cause:** an engine can fill an `NVNbuffer`-sized slot itself, with no `nvnBufferInitialize`: a 64-bit GPU address at +0 and a 32-bit size at +8, the rest left as it was, and pass it to `nvnBufferGetAddress`, which on the Switch returns those 8 bytes. The host read its own record from it and took the size as its pool pointer.
+- **Fix:** the host's record starts with its tag `'BUF\0'` (0x00465542), which is not 4-byte aligned, and a buffer address always is: a buffer without the tag is such a view, and `nvnBufferGetAddress`, `GetSize` and `Map` read it as {address, size} (`buf_view`, `hle_nvn.c`). `GetMemoryPool` and `GetMemoryOffset` on a view log a red line once and return NULL and 0. Buffers the host initialized, guest offset and size rewrites included, are unchanged.
+- **Found on:** Unravel Two 1.0.1 (`0100E5D00CC0C000`, SDK 6.4, PhyreEngine; no profile yet): the GPU particles' indirect-argument data block, bound by `main+0x7133e8`.
+- **Check:** `t_nvn.c` queries a view written over a slot filled with 0xa5: address, size, map and the absent pool.
+
 ### Sizes the hardware never reports as 0 (ZCull save area)
 
 - **Symptom:** sprites broke apart in some runs only, depending on the allocation order; buffers overlapped.

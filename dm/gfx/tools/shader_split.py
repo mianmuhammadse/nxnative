@@ -1639,19 +1639,34 @@ def sumo_shaders(d, label):
     return out
 
 def phyre_shaders(d, label):
-    """Phyre's NVN code immediately precedes its control section, unaligned in RYHP effects; loose blobs also prefix their two lengths (FFX/X-2)."""
+    """Phyre's NVN code immediately precedes its control section, unaligned in RYHP effects; loose blobs also prefix their two lengths (FFX/X-2). A compute shader's code has no
+    header (glslc_stage: the control's thread group is filled): Unravel Two's 661 compute controls, its GPU particles among them, whose dispatches had no shader without them."""
     out = []
     for m in re.finditer(re.escape(CTL_MAGIC), d):
         c = m.start()
-        if c + 0x708 > len(d): continue
+        if c + 0x760 > len(d): continue
         cn = struct.unpack_from('<I', d, c + 0x20)[0]
         kn = struct.unpack_from('<I', d, c + 0x704)[0]
         k = c - kn
-        if k < 0 or kn < 0x80 or cn < 0x760 or c + cn > len(d) or d[k:k + 4] != GFX_MAGIC: continue
+        if k < 0 or kn < 0x80 or cn < 0x760 or c + cn > len(d): continue
         ctl, code = d[c:c + cn], d[k:c]
-        st = sph_stage(code)
+        st = sph_stage(code) if code[:4] == GFX_MAGIC else 'cs' if glslc_stage(ctl, code) == 'cs' else None
         if st and not check(label, st, ctl, code): out.append((f'{label}#PHYRE@{k:#x}', st, ctl, code))
     return out
+
+
+def kit_shaders(path, rel, found):
+    """The Phyre effects (RYHP) among a kit archive's members (kit.py), labelled by chunk and name hash; the other members (textures, meshes, scripts) are decoded and passed over."""
+    import kit
+    by_chunk = collections.defaultdict(list)
+    for e in kit.entries(path): by_chunk[e[2]].append(e)
+    for chunk, es in sorted(by_chunk.items()):
+        with open(f'{path}.{chunk}', 'rb') as f:
+            seen = set()
+            for e in sorted(es, key=lambda e: e[3]):
+                if e[3] in seen: continue   # a record sharing another's bytes
+                seen.add(e[3]); d = kit.read(f, e)
+                if d[:4] == b'RYHP': found += phyre_shaders(d, f'/{rel}.{chunk}/{e[0]:08x}')
 
 
 def raw_shaders(d, label, known=()):
@@ -2581,6 +2596,7 @@ def scan_file_in(args):
     path, rel = args[:2]
     stem, ext = os.path.splitext(path)
     if ext in ('.data', '.patch', '.debug', '.nxpc') and os.path.exists(stem + '.dict'): return rel, {}, set(), {}   # read through its Next Level Games index (nlg_shaders)
+    if ext[1:].isdigit() and stem.endswith('.kit') and os.path.exists(stem): return rel, {}, set(), {}   # a kit archive's data chunk, read through its index (kit_shaders)
     with open(path, 'rb') as f: head = f.read(16)
     found = []; trees = {}
     if len(args) > 2 and args[2][0] == b'ARH1':
@@ -2654,6 +2670,9 @@ def scan_file_in(args):
         return rel, uniq_keys(found), var_pairs(found), trees
     if head[:8] == GFPAK:   # a Game Freak archive (gfpak_members): each entry scanned as a file of its own (the shaders are BNSH entries)
         for nm, m in gfpak_members(open(path, 'rb').read(), '/' + rel): scan_blob(m, f'/{rel}{nm}', found)
+        return rel, uniq_keys(found), var_pairs(found), trees
+    if head[:4] == b'kit!':   # Coldwood's kit archive (kit.py): the Phyre effects are LZ4 members of its numbered chunks (Unravel Two: 2,231 programs, all in Data.kit.0)
+        kit_shaders(path, rel, found)
         return rel, uniq_keys(found), var_pairs(found), trees
     if head[:4] == b'SRYK':
         import vbf

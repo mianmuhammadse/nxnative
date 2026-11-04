@@ -52,5 +52,15 @@ class Vbf(unittest.TestCase):
         self.assertEqual([x[1] for x in split.phyre_shaders(bad, 'bad')], ['ps'])
         self.assertEqual(split.phyre_shaders(b'RYHP' + split.CTL_MAGIC, 'short'), [])
 
+    def test_headerless_compute(self):
+        code = bytes(range(256))   # instructions from +0, no 0x12345679 header (Unravel Two)
+        ctl = bytearray(0x880); ctl[:4] = split.CTL_MAGIC
+        struct.pack_into('<I', ctl, 0x20, len(ctl)); struct.pack_into('<I', ctl, 0x704, len(code))
+        struct.pack_into('<3I', ctl, 0x748, 8, 8, 1)
+        found = split.phyre_shaders(b'RYHP' + bytes(5) + code + bytes(ctl), 'effect')
+        self.assertEqual([(x[1], x[3]) for x in found], [('cs', code)])
+        struct.pack_into('<3I', ctl, 0x748, 0, 0, 0)   # no thread group: not a compute shader, and no graphics header either
+        self.assertEqual(split.phyre_shaders(b'RYHP' + bytes(5) + code + bytes(ctl), 'effect'), [])
+
 
 if __name__ == '__main__': unittest.main()
