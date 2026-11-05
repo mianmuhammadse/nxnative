@@ -13,6 +13,7 @@
 #include <pthread.h>
 #include <stdatomic.h>
 #include <unistd.h>
+#include <fcntl.h>
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -107,8 +108,104 @@ static void probe_dump_once(void) {
     fwrite(m->base + strtoull(o, 0, 16), 1, strtoull(n, 0, 16), fp); fclose(fp);
     LOG("probe dump %s+%s length %s → %s", mod, o, n, f ? f : def);
 }
+// DM_PROBE_RING=<file>: probe hits are recorded, not printed, in a ring of the last RING_N (probe, thread, time, x0–x23, lr), written to the file when the process dies of a signal:
+// printing every hit slowed the thread enough to hide a race (Unravel Two: the reference-count loops main+0x694f28 / 0x695290 log 4,000 increments a second; with every hit printed
+// none of five runs crashed). File: a header {'RING', count, next} then the entries (struct ring_ent)
+#define RING_N (1u << 18)
+typedef struct { uint64_t t; uint32_t probe, thr; uint64_t x[24], lr; } ring_ent;
+static ring_ent *g_ring; static _Atomic uint32_t g_ring_next; static const char *g_ring_path;
+static void ring_write(void) {
+    if (!g_ring) return;
+    int fd = open(g_ring_path, O_WRONLY | O_CREAT | O_TRUNC, 0644); if (fd < 0) return;
+    uint32_t h[4] = {0x474e4952, RING_N, atomic_load(&g_ring_next), (uint32_t)sizeof(ring_ent)};
+    write(fd, h, sizeof h); write(fd, g_ring, sizeof(ring_ent) * RING_N); close(fd);
+    fprintf(stderr, "[dm] probe ring: %u hits, written to %s\n", h[2], g_ring_path);
+}
+// DM_HWWATCH=@x<N>+<offset>+<length> (hex): an ARM hardware watchpoint on the bytes at register xN + offset of the first reported DM_PROBE hit (its filters pick the object), in every
+// thread: no cost until a store reaches them, so a race that any probe or page watch hides still happens. Once armed, every probe is removed (its traps would slow the thread). A store
+// that hits prints the thread, pc, lr, the store address and size, the 8 bytes there before it and a backtrace; the thread's watchpoint is then off for the one instruction, which runs again
+// (an exclusive store fails once and its loop retries), and a host thread arms every thread again every 2 ms (new threads too). Regions: up to 4 aligned power-of-two blocks covering the
+// bytes, so stores just beside them hit as well and print their address. Unravel Two: the boot-time material blocks whose pointers gain 2^32 a minute later
+#if !TARGET_OS_IPHONE
+static int g_hw_reg = -1, g_hw_keep = -1; static uint64_t g_hw_off, g_hw_len; static _Atomic int g_hw_on;   // g_hw_keep: DM_HWWATCH_KEEP, the DM_PROBE entry (0-based) left in place, reporting only hits whose x1 lies in the watched regions (a free of the watched object)
+static uint64_t g_hw_lo, g_hw_hi; static arm_debug_state64_t g_hw_ds; static uint32_t g_hw_lsc = 2;   // WCR LSC: 2 stores, 3 loads and stores (DM_HWWATCH_RW=1)
+static void hw_regions(uint64_t a, uint64_t len) {   // cover [a, a + len) with at most 4 aligned power-of-two regions (WCR MASK), the smallest that fit
+    memset(&g_hw_ds, 0, sizeof g_hw_ds);
+    for (int m = 3; m < 31; m++) {
+        uint64_t sz = 1ull << m, lo = a & ~(sz - 1), hi = (a + len + sz - 1) & ~(sz - 1);
+        if ((hi - lo) / sz > 4) continue;
+        int k = 0; for (uint64_t r = lo; r < hi; r += sz, k++) { g_hw_ds.__wvr[k] = r; g_hw_ds.__wcr[k] = 1 | (2u << 1) | (g_hw_lsc << 3) | (m > 3 ? ((uint32_t)m << 24) | (0xffu << 5) : 0xffu << 5); }
+        g_hw_lo = lo; g_hw_hi = hi; return;
+    }
+    die("DM_HWWATCH: no region cover");
+}
+static void *hw_rearm(void *p) {
+    (void)p; thread_act_t self = mach_thread_self();
+    for (;;) {
+        thread_act_array_t ths; mach_msg_type_number_t n = 0;
+        if (task_threads(mach_task_self(), &ths, &n) == KERN_SUCCESS) {
+            for (mach_msg_type_number_t i = 0; i < n; i++) { if (ths[i] != self) thread_set_state(ths[i], ARM_DEBUG_STATE64, (thread_state_t)&g_hw_ds, ARM_DEBUG_STATE64_COUNT); mach_port_deallocate(mach_task_self(), ths[i]); }
+            vm_deallocate(mach_task_self(), (vm_address_t)ths, n * sizeof *ths);
+        }
+        usleep(2000);
+    }
+    return NULL;
+}
+static void probes_remove(void) {   // put every probed instruction back
+    for (int i = 0; i < g_nprobe; i++) {
+        if (i == g_hw_keep) continue;
+        uint32_t *w = (uint32_t *)g_probe[i].at; uint64_t pg = (uint64_t)w & ~0x3FFFull;
+        if (mprotect((void *)pg, 0x4000, PROT_READ | PROT_WRITE)) continue;
+        *w = g_probe[i].slot[0]; mprotect((void *)pg, 0x4000, PROT_READ | PROT_EXEC); sys_icache_invalidate(w, 4);
+    }
+}
+static void watch_where(const char *tag, uint64_t a);
+static int watch_decode(ucontext_t *uc, uint32_t in, uint64_t *ea, unsigned *len, uint8_t *data, int *wb, uint64_t *wbv);
+static int hw_hit(ucontext_t *uc) {   // a watchpoint exception: the store's address is FAR
+    if (!atomic_load(&g_hw_on)) return 0;
+    uint64_t far = uc->uc_mcontext->__es.__far, pc = uc->uc_mcontext->__ss.__pc;
+    if (far < g_hw_lo || far >= g_hw_hi) return 0;
+    arm_debug_state64_t off; memset(&off, 0, sizeof off);   // this thread's watchpoints off first (the handler reads the watched bytes); the access runs when the handler returns, hw_rearm arms the thread again
+    { thread_act_t me = mach_thread_self(); thread_set_state(me, ARM_DEBUG_STATE64, (thread_state_t)&off, ARM_DEBUG_STATE64_COUNT); mach_port_deallocate(mach_task_self(), me); }
+    uint32_t in = *(uint32_t *)pc; uint64_t ea = far, old = 0; unsigned len = 0; uint8_t data[64]; int wb; uint64_t wbv;
+    int dec = watch_decode(uc, in, &ea, &len, data, &wb, &wbv);
+    memcpy(&old, (void *)(far & ~7ull), 8);
+    uint64_t nv = 0; if (dec && len <= 8) memcpy(&nv, data, len);
+    flockfile(stderr);
+    { extern uint64_t g_t0_ns; uint64_t now_ns(void); uint32_t thr_cur_handle(void);
+      fprintf(stderr, "[dm] HWWATCH [%.4fs] T=%x %s at %#llx (%s+%#llx) instruction %08x %s%u bytes %#llx, 8 bytes at %#llx before: %#llx", (now_ns() - g_t0_ns) / 1e9, thr_cur_handle(), dec ? "store" : "access",
+              (unsigned long long)ea, far >= g_hw_lo + 0 && ea >= g_hw_lo ? "region" : "?", (unsigned long long)(ea - g_hw_lo), in, dec ? "" : "(not decoded) ", len, (unsigned long long)nv,
+              (unsigned long long)(far & ~7ull), (unsigned long long)old); }
+    watch_where("pc", pc); watch_where("lr", uc->uc_mcontext->__ss.__lr); fputc('\n', stderr);
+    dm_backtrace(uc->uc_mcontext->__ss.__fp);
+    funlockfile(stderr);
+    return 1;
+}
+static int g_hw_multi; static uint64_t g_hw_at[4]; static int g_hw_nat;   // DM_HWWATCH_MULTI=<n ≤ 4>: one 8-byte watchpoint each on the first n distinct addresses (length ≤ 8, within one doubleword)
+static void hw_arm_multi(void) {
+    memset(&g_hw_ds, 0, sizeof g_hw_ds); g_hw_lo = UINT64_MAX; g_hw_hi = 0;
+    for (int k = 0; k < g_hw_nat; k++) {
+        uint64_t a = g_hw_at[k], dw = a & ~7ull; uint32_t bas = ((1u << g_hw_len) - 1) << (a & 7);
+        g_hw_ds.__wvr[k] = dw; g_hw_ds.__wcr[k] = 1 | (2u << 1) | (g_hw_lsc << 3) | ((bas & 0xff) << 5);
+        if (dw < g_hw_lo) g_hw_lo = dw; if (dw + 8 > g_hw_hi) g_hw_hi = dw + 8;
+        LOG("HWWATCH %d: %#llx + %llu", k, (unsigned long long)a, (unsigned long long)g_hw_len);
+    }
+    probes_remove(); atomic_store(&g_hw_on, 1);
+    pthread_t t; pthread_create(&t, NULL, hw_rearm, NULL); pthread_detach(t);
+}
+static void hw_arm(uint64_t a) {
+    hw_regions(a, g_hw_len);
+    probes_remove();
+    atomic_store(&g_hw_on, 1);
+    LOG("HWWATCH armed: %#llx + %#llx, regions %#llx..%#llx (probes removed)", (unsigned long long)a, (unsigned long long)g_hw_len, (unsigned long long)g_hw_lo, (unsigned long long)g_hw_hi);
+    pthread_t t; pthread_create(&t, NULL, hw_rearm, NULL); pthread_detach(t);
+}
+#endif
 static int probe_hit(ucontext_t *uc) {   // Registered by probe_install with the SIGTRAP branch of crash.c
     uint64_t pc = uc->uc_mcontext->__ss.__pc;
+#if !TARGET_OS_IPHONE
+    if (hw_hit(uc)) return 1;
+#endif
     for (int i = 0; i < g_nprobe; i++) if (g_probe[i].at == pc) {
         if (g_probe[i].fn) { g_probe[i].hits++; g_probe[i].fn(uc); uc->uc_mcontext->__ss.__pc = (uint64_t)g_probe[i].slot; return 1; }
         uint64_t frame = dm_guest_frame();
@@ -123,6 +220,30 @@ static int probe_hit(ucontext_t *uc) {   // Registered by probe_install with the
         if (g_probe[i].hreg >= 0 && g_hw.want) {   // !xN with DM_PROBE_HEAPNAME: report only hits on heaps of that name
             char nm[128]; probe_heapname(uc->uc_mcontext->__ss.__x[g_probe[i].hreg], nm, sizeof nm);
             if (!strstr(nm, g_hw.want)) { uc->uc_mcontext->__ss.__pc = (uint64_t)g_probe[i].slot; return 1; }
+        }
+#if !TARGET_OS_IPHONE
+        if (i == g_hw_keep) {   // DM_HWWATCH_KEEP: only hits on the watched bytes, printed in full
+            uint64_t x1 = uc->uc_mcontext->__ss.__x[1];
+            if (!atomic_load(&g_hw_on) || x1 < g_hw_lo || x1 >= g_hw_hi) { uc->uc_mcontext->__ss.__pc = (uint64_t)g_probe[i].slot; return 1; }
+        } else
+        if (g_hw_reg >= 0) {   // DM_HWWATCH: arm on this hit and run on (the probes are removed)
+            static _Atomic int once; uint64_t a = uc->uc_mcontext->__ss.__x[g_hw_reg] + g_hw_off;
+            if (g_hw_multi) {   // collect the first n distinct addresses (probe hits are serialized enough for a diagnostic)
+                static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER; pthread_mutex_lock(&mu);
+                int seen = 0; for (int k = 0; k < g_hw_nat; k++) seen |= g_hw_at[k] == a;
+                if (!seen && g_hw_nat < g_hw_multi && !atomic_load(&once)) { g_hw_at[g_hw_nat++] = a; if (g_hw_nat == g_hw_multi) { atomic_store(&once, 1); hw_arm_multi(); } }
+                pthread_mutex_unlock(&mu);
+            } else
+            if (!atomic_exchange(&once, 1)) hw_arm(a);
+            uc->uc_mcontext->__ss.__pc = (uint64_t)g_probe[i].slot; return 1;
+        }
+#endif
+        if (g_ring) {
+            extern uint64_t g_t0_ns; uint64_t now_ns(void); uint32_t thr_cur_handle(void);
+            ring_ent *r = &g_ring[atomic_fetch_add(&g_ring_next, 1) & (RING_N - 1)];
+            r->t = now_ns() - g_t0_ns; r->probe = (uint32_t)i; r->thr = thr_cur_handle(); r->lr = uc->uc_mcontext->__ss.__lr;
+            for (int k = 0; k < 24; k++) r->x[k] = uc->uc_mcontext->__ss.__x[k];
+            g_probe[i].hits++; uc->uc_mcontext->__ss.__pc = (uint64_t)g_probe[i].slot; return 1;
         }
         probe_dump_once();
         flockfile(stderr);   // One block per hit when threads hit at once
@@ -371,9 +492,80 @@ static void watch_install(void) {
 
 #endif
 
+// DM_RECORD=<file> with DM_RECORD_SITES=<module>:<offset>/<register>,… (at most 8): a register's value at those instructions, recorded at native speed with no trap. The instruction
+// becomes a branch to a stub just below the module that takes a slot of a ring of 2^20 with one LDADD, stores the register and CNTVCT (shifted left 4, low bits the site's index),
+// runs the original instruction and branches back; the ring is written to the file when the process dies of a signal ({'RECR', count, next, 16} then the entries). The stub uses x16 and
+// x17: sites must have both dead, and the instruction must not be PC-relative. For races that any trap hides (Unravel Two: the reference-count increments of main+0x694f28 / 0x695290)
+#define REC_N (1u << 20)
+static uint64_t *g_rec; static _Atomic uint64_t g_rec_next; static const char *g_rec_path;
+static void record_write(void) {
+    if (!g_rec) return;
+    int fd = open(g_rec_path, O_WRONLY | O_CREAT | O_TRUNC, 0644); if (fd < 0) return;
+    uint32_t h[4] = {0x52434552, REC_N, (uint32_t)atomic_load(&g_rec_next), 16};
+    write(fd, h, sizeof h); write(fd, g_rec, 16ull * REC_N); close(fd);
+    fprintf(stderr, "[dm] record: %llu entries, written to %s\n", (unsigned long long)atomic_load(&g_rec_next), g_rec_path);
+}
+static void record_install(void) {
+    void crash_set_fatal_hook(void (*)(void));
+    if (!(g_rec_path = getenv("DM_RECORD"))) return;
+    const char *e = getenv("DM_RECORD_SITES"); if (!e) die("DM_RECORD needs DM_RECORD_SITES=<module>:<offset>/<register>,...");
+    if (!(g_rec = calloc(REC_N, 16))) die("DM_RECORD: no memory for the ring");
+    char spec[512]; strlcpy(spec, e, sizeof spec); int idx = 0; uint32_t *stubs = NULL; uint64_t near = 0;
+    for (char *t = strtok(spec, ","); t && idx < 8; t = strtok(NULL, ","), idx++) {
+        char *c = strchr(t, ':'), *sl = strchr(t, '/'); if (!c || !sl) die("DM_RECORD_SITES format: <module>:<offset>/<register>");
+        *c = 0; module_t *m = NULL; for (int i = 0; i < g_nmod; i++) if (!strcmp(g_mod[i].name, t)) m = &g_mod[i];
+        if (!m) die("DM_RECORD_SITES: no such module %s", t);
+        uint64_t at = (uint64_t)m->base + strtoull(c + 1, 0, 16); char *e2; int reg = (int)strtol(sl + 1, &e2, 10) & 31, reg2 = *e2 == '+' ? (int)strtol(e2 + 1, 0, 10) & 31 : -1;   // /<reg>[+<reg2>]: reg2 replaces the time stamp
+        if (!stubs) {   // one page just below the first site's module, within the reach of a B (±128 MB)
+            for (int64_t d = 0x4000; d < 0x7f00000 && !stubs; d += 0x4000)   // nearest free page either side of the site
+                for (int sgn = -1; sgn <= 1 && !stubs; sgn += 2) {
+                    mach_vm_address_t a = ((at & ~0x3fffull) + (uint64_t)(sgn * d));
+                    if (mach_vm_allocate(mach_task_self(), &a, 0x4000, VM_FLAGS_FIXED) == KERN_SUCCESS) { stubs = (uint32_t *)a; near = a; }
+                }
+            if (!stubs) die("DM_RECORD: no page within branch reach of %s", m->name);
+            LOG("DM_RECORD: stubs at %#llx", (unsigned long long)near);
+        }
+        uint32_t *st = stubs + idx * 20, *w = (uint32_t *)at; int64_t d = (int64_t)((uint64_t)st - at);
+        if (d < -(1ll << 27) || d >= (1ll << 27)) die("DM_RECORD: site %s+%s out of branch reach of the stubs", t, c + 1);
+        static const uint32_t tpl[14] = {0x580001d0, 0xd2800031, 0xf8310211, 0x92404e31, 0x58000190, 0x8b111210, 0xf9000209, 0xd53be051, 0xd37cee31, 0xb2400231, 0xf9000611, 0xd503201f, 0x580000d0, 0xd61f0200};
+        memcpy(st, tpl, sizeof tpl);
+        st[6] = 0xf9000200 | (uint32_t)reg;                                            // str x<reg>, [x16]
+        st[9] = idx ? 0xb2400231 | ((uint32_t)(idx == 1 ? 0 : 0) << 10) : 0xd503201f;   // orr x17, x17, #1 for site 1; site 0 leaves the low bits 0
+        if (idx > 1) { st[9] = 0xd503201f; }                                            // sites 2+ share tag 0 (record their register's value only)
+        if (reg2 >= 0) { st[7] = 0xf9000600 | (uint32_t)reg2; st[8] = st[9] = st[10] = 0xd503201f; }   // str x<reg2>, [x16, #8]
+        st[11] = *w;                                                                    // the original instruction
+        uint64_t *lit = (uint64_t *)(st + 14); lit[0] = (uint64_t)&g_rec_next; lit[1] = (uint64_t)g_rec; lit[2] = at + 4;
+        LOG("DM_RECORD: site %d %s+%s, register x%d (instruction %08x)", idx, t, c + 1, reg, *w);
+        (void)near;
+    }
+    mprotect(stubs, 0x4000, PROT_READ | PROT_EXEC); sys_icache_invalidate(stubs, 0x4000);
+    // the branches go in last, once every stub is executable
+    strlcpy(spec, e, sizeof spec); idx = 0;
+    for (char *t = strtok(spec, ","); t && idx < 8; t = strtok(NULL, ","), idx++) {
+        char *c = strchr(t, ':'); *c = 0; module_t *m = NULL; for (int i = 0; i < g_nmod; i++) if (!strcmp(g_mod[i].name, t)) m = &g_mod[i];
+        uint64_t at = (uint64_t)m->base + strtoull(c + 1, 0, 16); uint32_t *w = (uint32_t *)at, *st = stubs + idx * 20;
+        uint64_t pg = at & ~0x3FFFull;
+        if (mprotect((void *)pg, 0x4000, PROT_READ | PROT_WRITE)) die("DM_RECORD mprotect");
+        *w = 0x14000000 | (uint32_t)((((int64_t)st - (int64_t)at) >> 2) & 0x3ffffff);
+        mprotect((void *)pg, 0x4000, PROT_READ | PROT_EXEC); sys_icache_invalidate(w, 4);
+    }
+    crash_set_fatal_hook(record_write);
+    LOG("DM_RECORD: %d sites, ring of %u written to %s at a crash", idx, REC_N, g_rec_path);
+}
 void probe_install(void) {
 #if !TARGET_OS_IPHONE
     crash_set_trap_hook(probe_hit);
+    { const char *e = getenv("DM_HWWATCH"); char *end;
+      if (e) { if (e[0] != '@' || e[1] != 'x') die("DM_HWWATCH format: @x<N>+<offset>+<length> (hex)");
+               g_hw_reg = (int)strtol(e + 2, &end, 10); g_hw_off = *end == '+' ? strtoull(end + 1, &end, 16) : 0; g_hw_len = *end == '+' ? strtoull(end + 1, &end, 16) : 8;
+               if (g_hw_reg < 0 || g_hw_reg > 30 || !g_hw_len) die("DM_HWWATCH format: @x<N>+<offset>+<length> (hex)");
+               { const char *k = getenv("DM_HWWATCH_KEEP"); if (k) g_hw_keep = atoi(k); }
+               { const char *rw = getenv("DM_HWWATCH_RW"); if (rw && atoi(rw)) g_hw_lsc = 3; }
+               { const char *mu = getenv("DM_HWWATCH_MULTI"); if (mu) { g_hw_multi = atoi(mu); if (g_hw_multi < 1 || g_hw_multi > 4 || g_hw_len > 8) die("DM_HWWATCH_MULTI: 1 to 4 addresses of at most 8 bytes"); } }
+               LOG("DM_HWWATCH: hardware watchpoint on x%d + %#llx + %#llx of the first reported probe hit", g_hw_reg, (unsigned long long)g_hw_off, (unsigned long long)g_hw_len); } }
+    if ((g_ring_path = getenv("DM_PROBE_RING"))) { void crash_set_fatal_hook(void (*)(void));
+        if (!(g_ring = calloc(RING_N, sizeof *g_ring))) die("DM_PROBE_RING: no memory for the ring");
+        crash_set_fatal_hook(ring_write); LOG("DM_PROBE_RING: probe hits recorded in a ring of %u, written to %s at a crash", RING_N, g_ring_path); }
     const char *frames = getenv("DM_PROBE_FRAMES");
     if (frames) {
         char *end; g_probe_frame_first = strtoull(frames, &end, 10);
@@ -414,6 +606,7 @@ void probe_install(void) {
         }
     }
     if (g_slots && !g_slots_sealed) { mprotect(g_slots, 0x4000, PROT_READ | PROT_EXEC); sys_icache_invalidate(g_slots, 0x4000); g_slots_sealed = 1; }
+    record_install();
     watch_install();
 #endif
 }

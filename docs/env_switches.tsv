@@ -68,6 +68,10 @@ DM_HLECOUNT	diagnostic	`=<file>` (`%d` = process ID) writes at exit a TSV of how
 DM_HOME_QUIT	player	`0` turns off quitting with the controller's Home button (Mac, on by default): held for 2 s it opens a quit prompt over the game, A quits as ⌘Q does, B or Home closes it (`home_quit.h`)
 DM_HOME_QUIT_CAPTURE	test	`=<folder>`: `tests/t_home_quit_mac.m` also draws the Home button's quit prompt and hold indicator into PNG files there
 DM_HOME_QUIT_TEXT	switch	The texts of the Home button's quit prompt in the player's language, one per line: the hold indicator, the title, the note, the quit and the cancel button; a front end such as NX2Apple sets it ([Starting a game](frontends.md#starting-a-game)), an empty or missing line keeps the English text
+DM_HWWATCH	diagnostic	`=@x<N>+<offset>+<length>` (hex, Mac only): an ARM hardware watchpoint on those bytes at register xN + offset of the first reported `DM_PROBE` hit, in every thread; no cost until a store reaches them (races that a probe or `DM_PROBE_WATCH` hide still happen). Once armed the probes are removed; each hit prints thread, pc, lr, address, size, the old 8 bytes and a backtrace
+DM_HWWATCH_KEEP	diagnostic	`=<index>` (0-based `DM_PROBE` entry): that probe stays after `DM_HWWATCH` arms and reports only hits whose x1 lies in the watched bytes (a `Free` of the watched object)
+DM_HWWATCH_MULTI	diagnostic	`=<n>` (1–4): `DM_HWWATCH` watches the first n distinct addresses its probe reports, one watchpoint each (length at most 8, within one doubleword)
+DM_HWWATCH_RW	diagnostic	`=1`: `DM_HWWATCH` traps loads as well as stores
 DM_ICON	path	`=<image>` gives `build_ipa.sh` another app icon (default the `icon.jpg` beside the RomFS)
 DM_IMPORTS	diagnostic	When set, logs each import the loader binds to a host function and each forced takeover
 DM_KBD	switch	`=<text>`: the system keyboard returns that text as OK without showing an input box; unset with no window, it returns cancel
@@ -243,6 +247,7 @@ DM_PROBE_HEAPRAW	diagnostic	Set: the probes' heap walk also prints the heap obje
 DM_PROBE_HEAPWORDS	diagnostic	Set: the probes' heap walk also prints each used block's first two words
 DM_PROBE_LIMIT	diagnostic	Maximum printed hits per guest probe; 0 or absent leaves the count unlimited
 DM_PROBE_POLL	diagnostic	`=<address>[+<length>]` (hex, 4 bytes by default, up to 8): a host thread spins on the bytes and on each change snapshots every thread's pc, lr and frames, for writes the watch misses
+DM_PROBE_RING	diagnostic	`=<file>`: probe hits are recorded in a ring of the last 2^18 (probe, thread, time, x0–x23, lr) instead of printed, and the ring is written to the file when the process dies of a signal
 DM_PROBE_WATCH	diagnostic	`=<address>[+<length>]` (hex, 8 bytes by default): write-protects that host page and reports who writes these bytes, without a debugger
 DM_PROBE_X2	diagnostic	`=<bytes>` (hex): probe hits also dump that many bytes of the memory x2 points to
 DM_PROGRAM_ID	switch	`=<hex>`: the program ID the host reports from `svcGetInfo(ProgramId)` (default: the profile's `program_id`)
@@ -266,6 +271,8 @@ DM_PSO_WAITLOG	diagnostic	`=1` logs each draw that waited more than 20 ms for it
 DM_QOS_EDGES	switch	`=e1,e2`: the Switch priority edges of `DM_QOS_MAP` (default `44,59`)
 DM_QOS_MAP	switch	`=1` maps guest thread priority to QoS class: ≤ 44 user-interactive, 45–59 user-initiated, the rest utility (off by default: every guest thread runs user-interactive)
 DM_REC	diagnostic	`=<file>`: writes player 1's physical input (keyboard, mouse touches, controllers; never `DM_KEYS` / `DM_CTL`) to the file as `DM_KEYS` steps in presented frames, for replaying a run (`DM_KEYS=@<file>`)
+DM_RECORD	diagnostic	`=<file>` (Mac only): records registers at the instructions of `DM_RECORD_SITES` at native speed, with no trap, in a ring of 2^20 written to the file when the process dies of a signal
+DM_RECORD_SITES	diagnostic	`=<module>:<offset>/<register>[+<register2>],…` (at most 8): the instructions `DM_RECORD` turns into a branch to a stub that stores the register (and register2, or the time stamp) and runs the original instruction; the stub uses x16 and x17, which must be dead there, and the instruction must not be PC-relative
 DM_REGIONS	diagnostic	`=<file>` writes the table of the SDK's address regions every 2 s (alias offset, size, where the request returns to in the game, bytes mapped, the part opened, the SDK offset the request came through; `hle_svc.c` "Address regions"); the NSP script's address region check sets it
 DM_RENDER_SCALE	player	`0.5` to `1.0`: fixes the game's 3D views at that fraction of their size and turns its dynamic resolution off, for builds with a render scale stub; `1.0` (the default) keeps it
 DM_RESOURCE_AOC	path	The add-on content folder the iOS build copies into the app's `aoc/` (empty for none); written by `gen_resources.py`, read by `stage_resources.sh`
