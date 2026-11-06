@@ -27,6 +27,8 @@ Games whose speed the app controls (Breath of the Wild, Tears of the Kingdom and
 
 A game known to follow real time on its own (Metroid Dread) offers **Auto** or **30 fps** instead. Auto follows the game (Dread: 60 in play, 30 in cutscenes); 30 fps runs the GPU less, so the phone stays cooler and the battery lasts longer.
 
+On a Mac, a game checked at that speed (Fire Emblem Fortune's Weave, Mario & Luigi: Brothership) also offers **120 fps**. It needs a screen that shows 120 Hz, and uses more GPU and power. When frames do not fit, during movies, or on a slower screen, the game drops to 60 for a while, so it keeps its real speed. If you see the frame rate move between 60 and 120 and would rather it stayed still, choose 60.
+
 ### Render scale
 
 The size of the 3D picture, from 50 to 100 %. Below 100 % the size is fixed there and the game's own dynamic resolution is off; 100 % keeps the game's own. Lower can be lighter on the GPU but is blurrier; the HUD and text keep their sharpness. Only games the app can scale offer it.
@@ -73,7 +75,7 @@ flowchart LR
 
 ### Game language
 
-The game's own languages. The app was packed with one of them; pick another here without repacking.
+The game's own languages. The app was packed with one of them; pick another here without repacking. A game packed from a dump or a NUP may come without its list: every language is offered then, with a note, and a game that lacks the one you pick may show another.
 
 ### Picture
 
@@ -251,7 +253,7 @@ A line like `DM_PRESENT_SNAP=0` in `Documents/env.txt` (in the Files app, under 
 
 | Setting | Variable | Values |
 |---|---|---|
-| Frame rate | `DM_FPS_TARGET` | `30`, `60` |
+| Frame rate | `DM_FPS_TARGET` | `30`, `60`, `120` (Mac, games with `fps_max 120`) |
 | Frame rate (games that step by elapsed time) | `DM_FPS` | `0` Auto, `30` |
 | Render scale | `DM_RENDER_SCALE` | `0.5` to `1.0` |
 | Console mode | `DM_OPMODE` | `1` docked, `0` handheld |

@@ -11,6 +11,8 @@ static int hid_usleep(useconds_t usec);
 #undef clock_gettime
 #undef usleep
 #include "../pad_slots.h"
+void dm_oe_execute(int index, const void *param, size_t n) { (void)index; (void)param; (void)n; }   // DM_CTL "program", "webshot": not exercised here
+void front_web_shot(const char *path) { (void)path; }
 
 static int checks, fails, g_mode = 1, g_signals;
 static void *g_signalled;
@@ -167,6 +169,7 @@ static void t_vibration(void) {
     CHECK(!memcmp(&got, &v, sizeof v) && vibration[1].motor[0].amplitude_low == 0, "game value is retained for the addressed player only");
     h_hid_VibInfo(info, &h[1]); CHECK(info[0] == 1 && info[1] == 2, "right motor is a right LRA");
     CHECK(h_hid_VibMounted(&h[0]) && h_hid_VibMounted(&h[1]), "both motors of a routed controller are mounted");
+    CHECK(h_hid_VibMountedOunce(&h[0]) && h_hid_VibMountedOunce(&h[1]) && !h_hid_VibMountedOunce(NULL), "the Switch 2's form answers the same");
     uint32_t invalid[] = {0, 0x20003, 0x1000003, 0x203};
     int mounted = 0;
     for (unsigned i = 0; i < sizeof invalid / sizeof *invalid; i++) mounted |= h_hid_VibMounted(&invalid[i]);

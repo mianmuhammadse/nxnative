@@ -14,10 +14,10 @@
 HLE_FORCE("_ZN2nn2oe15SetCpuBoostModeENS0_12CpuBoostModeE", "CPU boost mode; the host does not scale clocks", void, h_oe_CpuBoost, int m) { (void)m; }
 // DisplayVersion = char[16] (the application's display version): the value from that version's control data (NACP), chosen by main's build ID (the game profile's build rows); unknown builds get 1.0.0
 HLE_FORCE("_ZN2nn2oe17GetDisplayVersionEPNS0_14DisplayVersionE", "display version (by the main build ID)", void, h_oe_DispVer, char *v) {
-    static const struct { const char *build, *ver; } k[] = {DM_GAME_DISPLAY_VERSIONS};
+    const struct { const char *build, *ver; } k[] = {DM_GAME_DISPLAY_VERSIONS};
     const char *ver = "1.0.0";
     for (int i = 0; i < g_nmod; i++) if (!strcmp(g_mod[i].name, "main"))
-        for (unsigned j = 0; j < sizeof k / sizeof *k; j++) if (!strcmp(g_mod[i].build_id, k[j].build)) ver = k[j].ver;
+        for (unsigned j = 0; j < sizeof k / sizeof *k; j++) if (k[j].build && !strcmp(g_mod[i].build_id, k[j].build)) ver = k[j].ver;
     memset(v, 0, 16); strlcpy(v, ver, 16);
 }
 HLE_FORCE("_ZN2nn2oe24GetExpectedVolumeBalanceEPfS1_", "system / application volume balance; the host always reports 1:1", void, h_oe_GetVolBal, float *sys, float *app) { *sys = 1.0f; *app = 1.0f; }
@@ -113,8 +113,39 @@ HLE_FORCE("_ZN2nn6fontll18ScalableFontEngine8LoadFontEPcPKvjj", "shared font BFT
     pthread_once(&font_load_once, font_load_init);
     return font_load(self, name, font_payload(data), index, capacity);
 }
+// A game sizes an engine's work memory for Nintendo's fonts, and the stand-in is far larger: Arial Unicode's 23 MB did not fit the 50 KB Mario Tennis Fever gives its second engine (nn::font's texture
+//   cache keeps one per glyph thread), so FSS_load_font ran out of memory (error 201), SetFont failed with 301, every lookup of the "?" glyph missed and nro0+0xaef8a8 crashed on a null pointer. An engine
+//   gets at least FONT_WORK_MIN of host memory then; the game's buffer stays unused, and GetPointerToWorkBuffer still gives it back, which is what the game frees
+#define FONT_WORK_MIN 0x80000   // what the same game's first engine gets, in which that font loads
+#define FONT_ENGINES 16
+static struct { void *self, *game, *host; } font_work[FONT_ENGINES];
+HLE_FORCE("_ZN2nn6fontll18ScalableFontEngine10InitializeEPvj", "a work buffer the stand-in font fits in; the engine itself stays in the SDK", void, h_font_Initialize, void *self, void *buf, unsigned size) {
+    static void (*init)(void *, void *, unsigned);
+    if (!init) init = guest_sym("_ZN2nn6fontll18ScalableFontEngine10InitializeEPvj");
+    if (size < FONT_WORK_MIN) {
+        pthread_mutex_lock(&font_mu);
+        int i = 0;
+        while (i < FONT_ENGINES && font_work[i].self && font_work[i].self != self) i++;
+        if (i < FONT_ENGINES) {
+            if (!font_work[i].host && !(font_work[i].host = malloc(FONT_WORK_MIN))) die("font engine work memory");
+            font_work[i].self = self; font_work[i].game = buf;
+            buf = font_work[i].host; size = FONT_WORK_MIN;
+        } else LOG("[RED] more than %d font engines with a small work buffer: this one keeps the game's", FONT_ENGINES);
+        pthread_mutex_unlock(&font_mu);
+    }
+    init(self, buf, size);
+}
+HLE_FORCE("_ZN2nn6fontll18ScalableFontEngine22GetPointerToWorkBufferEv", "the game's own buffer, also when the engine runs on host memory", void *, h_font_WorkBuffer, void *self) {
+    static void *(*get)(void *);
+    if (!get) get = guest_sym("_ZN2nn6fontll18ScalableFontEngine22GetPointerToWorkBufferEv");
+    void *game = NULL;
+    pthread_mutex_lock(&font_mu);
+    for (int i = 0; i < FONT_ENGINES && font_work[i].self; i++) if (font_work[i].self == self) game = font_work[i].game;
+    pthread_mutex_unlock(&font_mu);
+    return game ? game : get(self);
+}
 // The address points straight at the TTF (past the 8-byte header) and the size excludes the header, except for a game on SDK 11 or later whose main imports ScalableFontEngineHelper::Decode
-//   (dm_sdk_major, dm_main_imports; the profile's shared_font overrides). Super Mario 3D World + Bowser's Fury (SDK 10) records shared fonts as type 0 (main+0x975658), calls no Decode and hands the address
+//   (dm_sdk_major, dm_game_imports; the profile's shared_font overrides). Super Mario 3D World + Bowser's Fury (SDK 10) records shared fonts as type 0 (main+0x975658), calls no Decode and hands the address
 //   as is to ScalableFontEngine::LoadFont; with the header LoadFont fails with error 403 and SetFont with 301, every lookup of the "?" glyph then misses, and main+0x6c73c0 crashes on a null pointer.
 //   Odyssey (7), Link's Awakening (8), Age of Calamity (9) and Three Houses (6) take it the same way. Unity's player hands the address and size of every type straight to FreeType's FT_New_Memory_Face
 //   (Patrick's Parabox, SDK 13, Unity 2020.3: main+0x2390b0 maps its OS font names Switch_Font_STD … Switch_Font_NIN_Extended to types 0-5, then main+0x23b2e0), as libnx homebrew does with the same pl offsets;
@@ -126,7 +157,7 @@ static size_t font_skip(void) {
 #ifdef DM_GAME_SHARED_FONT_TTF
         skip = DM_GAME_SHARED_FONT_TTF ? 8 : 0; LOG("shared font: %s (game profile shared_font)", skip ? "the TTF itself" : "BFTTF header + TTF");
 #else
-        int m = dm_sdk_major(), dec = dm_main_imports("_ZN2nn6fontll24ScalableFontEngineHelper6Decode"); skip = DM_SDK_OLD(m) || !dec ? 8 : 0;
+        int m = dm_sdk_major(), dec = dm_game_imports("_ZN2nn6fontll24ScalableFontEngineHelper6Decode"); skip = DM_SDK_OLD(m) || !dec ? 8 : 0;
         LOG("shared font: %s (SDK %d, main %s ScalableFontEngineHelper::Decode)", skip ? "the TTF itself" : "BFTTF header + TTF", m, dec ? "imports" : "does not import");
 #endif
     }
@@ -134,6 +165,8 @@ static size_t font_skip(void) {
 }
 HLE_FORCE("_ZN2nn2pl22GetSharedFontLoadStateENS0_14SharedFontTypeE", "shared font load state: loaded (1)", int, h_pl_LoadState, int type) { return font_get(type).p ? 1 : 0; }
 HLE_FORCE("_ZN2nn2pl20GetSharedFontAddressENS0_14SharedFontTypeE", "shared font address → BFTTF header (archive shared_font ttf: the TTF itself)", const void *, h_pl_Addr, int type) { const uint8_t *p = font_get(type).p; return p ? p + font_skip() : NULL; }
+// SDK 22's request to load the Switch 1 fonts into a buffer of the game's goes through the pl service, which the host does not serve, and any failure aborts (PR 1434): the stand-in fonts come from host memory, so the buffer is left as it is
+HLE_FORCE("_ZN2nn2pl17RequestLoadNxFontEPvm", "load the shared fonts into the game's buffer; the stand-in fonts need none of it", void, h_pl_ReqNxFont, void *buf, size_t size) { (void)buf; (void)size; }
 HLE_FORCE("_ZN2nn2pl17GetSharedFontSizeENS0_14SharedFontTypeE", "shared font size → 8-byte header + stand-in font file size (archive shared_font ttf: without the header)", size_t, h_pl_Size, int type) { font_t f = font_get(type); return f.p ? f.n - font_skip() : 0; }
 // Every shared font at once (Rhythm Heaven Groove, SDK 21): the SDK asks the pl service for GetSharedFontInOrderOfPriority and, when the fonts are loaded, fills min(count, max) SharedFontData {u32 type; const void *address; size_t size}
 //   (0x18 bytes) with the shared memory base + each font's offset (sdk+0x40f270), then returns whether they are loaded; the game retries every 10 ms until they are (main+0x501f04). The service's offsets point past each font's 8-byte
@@ -205,6 +238,8 @@ static Result nfp_no_tag(const char *what) {
     return NFP_RES_TAG_NOT_FOUND;
 }
 HLE_FORCE("_ZN2nn3nfp10InitializeEv", "amiibo library init; the host has one NFC device that never finds a tag", void, h_nfp_Init, void) { atomic_store(&g_nfp_lib, 1); LOG("nfp::Initialize: the host has one NFC device and finds no amiibo tag"); }
+// Kirby Air Riders initializes it with this one instead; on the host the extended application area is no different, as no tag ever has one
+HLE_FORCE("_ZN2nn3nfp37InitializeWithExtendedApplicationAreaEv", "amiibo library init with the extended application area; the same device that never finds a tag", void, h_nfp_InitExt, void) { atomic_store(&g_nfp_lib, 1); LOG("nfp::InitializeWithExtendedApplicationArea: the host has one NFC device that never finds a tag"); }
 HLE_FORCE("_ZN2nn3nfp29AttachAvailabilityChangeEventEPNS_2os15SystemEventTypeE", "NFC availability change event; bound to a kernel event, never signalled", void, h_nfp_AttachAvail, void *ev) { hle_bind_system_event(ev, 0); }
 HLE_FORCE("_ZN2nn3nfp11ListDevicesEPNS0_12DeviceHandleEPii", "NFC device list: one device", Result, h_nfp_List, NfpDeviceHandle *out, int *n, int max) {
     *n = 0; if (max >= 1) { memset(&out[0], 0, sizeof out[0]); out[0].id = NFP_DEVICE_ID; *n = 1; }
@@ -233,6 +268,10 @@ HLE_FORCE("_ZN2nn3nfp18GetApplicationAreaEPvPmRKNS0_12DeviceHandleEm", "read app
 HLE_FORCE("_ZN2nn3nfp18SetApplicationAreaERKNS0_12DeviceHandleEPKvm", "write application area: no tag", Result, h_nfp_SetArea, const NfpDeviceHandle *h, const void *buf, uint64_t sz) { (void)h; (void)buf; (void)sz; return nfp_no_tag("SetApplicationArea"); }
 HLE_FORCE("_ZN2nn3nfp21CreateApplicationAreaERKNS0_12DeviceHandleERKNS0_25ApplicationAreaCreateInfoE", "create application area: no tag", Result, h_nfp_CreateArea, const NfpDeviceHandle *h, const void *info) { (void)h; (void)info; return nfp_no_tag("CreateApplicationArea"); }
 HLE_FORCE("_ZN2nn3nfp23RecreateApplicationAreaERKNS0_12DeviceHandleERKNS0_25ApplicationAreaCreateInfoE", "recreate application area: no tag", Result, h_nfp_RecreateArea, const NfpDeviceHandle *h, const void *info) { (void)h; (void)info; return nfp_no_tag("RecreateApplicationArea"); }
+HLE_FORCE("_ZN2nn3nfp26GetExtendedApplicationAreaEPvPmRKNS0_12DeviceHandleEm", "read extended application area: no tag", Result, h_nfp_GetAreaExt, void *buf, uint64_t *n, const NfpDeviceHandle *h, uint64_t sz) { (void)buf; (void)n; (void)h; (void)sz; return nfp_no_tag("GetExtendedApplicationArea"); }
+HLE_FORCE("_ZN2nn3nfp26SetExtendedApplicationAreaERKNS0_12DeviceHandleEPKvm", "write extended application area: no tag", Result, h_nfp_SetAreaExt, const NfpDeviceHandle *h, const void *buf, uint64_t sz) { (void)h; (void)buf; (void)sz; return nfp_no_tag("SetExtendedApplicationArea"); }
+HLE_FORCE("_ZN2nn3nfp30GetExtendedApplicationAreaInfoEPNS0_27ExtendedApplicationAreaInfoERKNS0_12DeviceHandleE", "extended application area info: no tag", Result, h_nfp_AreaExtInfo, void *out, const NfpDeviceHandle *h) { (void)out; (void)h; return nfp_no_tag("GetExtendedApplicationAreaInfo"); }
+HLE_FORCE("_ZN2nn3nfp7RestoreERKNS0_12DeviceHandleE", "restore tag: no tag", Result, h_nfp_Restore, const NfpDeviceHandle *h) { (void)h; return nfp_no_tag("Restore"); }
 HLE_FORCE("_ZN2nn3nfp13StartRestorerEPNS0_12DeviceHandleERKNS0_24AmiiboSettingsStartParamERKNS0_7TagInfoE", "amiibo restorer applet: no tag", Result, h_nfp_Restorer, NfpDeviceHandle *h, const void *p, const void *tag) { (void)h; (void)p; (void)tag; return nfp_no_tag("StartRestorer"); }
 HLE_FORCE("_ZN2nn3nfp19StartGameDataEraserEPNS0_12DeviceHandleERKNS0_24AmiiboSettingsStartParamERKNS0_7TagInfoE", "amiibo game data eraser applet: no tag", Result, h_nfp_Eraser, NfpDeviceHandle *h, const void *p, const void *tag) { (void)h; (void)p; (void)tag; return nfp_no_tag("StartGameDataEraser"); }
 HLE_FORCE("_ZN2nn3nfp29StartNicknameAndOwnerSettingsEPNS0_12DeviceHandleEPbPNS0_12RegisterInfoERKNS0_24AmiiboSettingsStartParamERKNS0_7TagInfoE", "amiibo nickname and owner settings applet: no tag", Result, h_nfp_Nick, NfpDeviceHandle *h, uint8_t *changed, void *reg, const void *p, const void *tag) { (void)h; (void)reg; (void)p; (void)tag; if (changed) *changed = 0; return nfp_no_tag("StartNicknameAndOwnerSettings"); }

@@ -208,9 +208,8 @@ Before publishing, the fixes were integrated with main's pipeline archive and GP
 ## Found on this game
 
 - [Restored phone motion](../../../docs/reference/services.md#coremotion-attitude-restored-for-phone-aiming-in-this-fork): CoreMotion attitude, axis flips and recenter restored from the motion branch; bow aiming and long-session drift still need device validation.
-
 - [Pressure trim lock type](../../../docs/reference/memory.md#pressure-trim-uses-the-texture-registrys-lock-type): resolved in this fork by matching the registry unfair-lock API; device pressure-path validation remains open.
-
+- [A library that depends on its source's file name](../../../docs/reference/shaders.md#a-library-that-depends-on-its-sources-file-name): 3,936 of its 10,560 pixel shaders share their `_bl` source.
 - **Resolved in the host: the taller picture was drawn smaller than the 16:9 one on the phone** (`DM_SCREEN_ASPECT=1.43`, Fit): [The picture laid out in the shape the game presents](../../../docs/reference/rendering.md#the-picture-laid-out-in-the-shape-the-game-presents).
 - **Resolved in the host: the encode thread stopped at a depth plane copy** (PR #930, on the Mac with `DM_NVN_ENC_THREAD=1`; not run here): [Depth plane copies on the encode thread](../../../docs/reference/rendering.md#depth-plane-copies-on-the-encode-thread).
 - [Same-pass feedback read from the tile](../../../docs/reference/rendering.md#same-pass-feedback-read-from-the-tile) (2026-11-03): the decals' G-buffer reads, about 320 draws a frame outdoors.
