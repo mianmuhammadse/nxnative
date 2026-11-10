@@ -2249,14 +2249,26 @@ NVN(nvnBufferInitialize, NVNboolean, NVNbuffer *buf, const NVNbufferBuilder *b) 
 }
 NVN(nvnBufferFinalize, void, NVNbuffer *buf) { ((buf_t *)buf)->magic = 0; }
 NVN(nvnBufferSetDebugLabel, void, NVNbuffer *buf, const char *s) { (void)buf; (void)s; }
-NVN(nvnBufferGetAddress, NVNbufferAddress, const NVNbuffer *buf) { return (NVNbufferAddress)(BF(buf)->pool->mem + BF(buf)->off); }
+// A buffer view the game writes itself, with no nvnBufferInitialize: its first 8 bytes are the GPU address and the next 4 the size (Unravel Two, SDK 6.4, PhyreEngine: the GPU
+// particles' indirect-argument data block fills its NVNbuffer slot with {GetAddress of the parent + offset, 0x20} and passes it to nvnBufferGetAddress, which on the Switch returns
+// those 8 bytes; the host read its record's pool from the size and faulted at 0x28). The host's record starts with its tag 'BUF\0' (0x00465542), which is not 4-byte aligned,
+// and a buffer address always is, so a buffer whose first word is not the tag is such a view; buffers the host initialized keep the record (#723's offset and size rewrites included)
+typedef struct { uint64_t addr; uint32_t size; } buf_view_t;
+static const buf_view_t *buf_view(const NVNbuffer *buf) { return BF(buf)->magic == MAGIC('B', 'U', 'F', 0) ? NULL : (const buf_view_t *)buf; }
+NVN(nvnBufferGetAddress, NVNbufferAddress, const NVNbuffer *buf) { const buf_view_t *v = buf_view(buf); return v ? (NVNbufferAddress)v->addr : (NVNbufferAddress)(BF(buf)->pool->mem + BF(buf)->off); }
 // A buffer or pool the CPU has no access to (NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS) maps to NULL, as in NVN, though the host's storage is CPU memory: EA SPORTS FC 27's Frostbite
 // renderer takes a buffer's GPU address as GetAddress + (its data pointer − Map), with a null data pointer for such a buffer (OpcodeCopySubresource), so a real pointer made the
 // copy's destination address 0 (FATAL buffer copy address is in no memory pool)
-NVN(nvnBufferMap, void *, const NVNbuffer *buf) { return BF(buf)->pool->flags & NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS ? NULL : BF(buf)->pool->mem + BF(buf)->off; }
-NVN(nvnBufferGetSize, size_t, const NVNbuffer *buf) { return (size_t)BF(buf)->size; }
-NVN(nvnBufferGetMemoryPool, NVNmemoryPool *, const NVNbuffer *buf) { return (NVNmemoryPool *)BF(buf)->pool; }
-NVN(nvnBufferGetMemoryOffset, ptrdiff_t, const NVNbuffer *buf) { return (ptrdiff_t)BF(buf)->off; }
+NVN(nvnBufferMap, void *, const NVNbuffer *buf) {   // a view's address is guest memory, as every host buffer address is
+    const buf_view_t *v = buf_view(buf); if (v) return (void *)(uintptr_t)v->addr;
+    return BF(buf)->pool->flags & NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS ? NULL : BF(buf)->pool->mem + BF(buf)->off; }
+NVN(nvnBufferGetSize, size_t, const NVNbuffer *buf) { const buf_view_t *v = buf_view(buf); return v ? (size_t)v->size : (size_t)BF(buf)->size; }
+NVN(nvnBufferGetMemoryPool, NVNmemoryPool *, const NVNbuffer *buf) {
+    if (buf_view(buf)) { ONCE_LOG("[RED] nvnBufferGetMemoryPool on a buffer view the game wrote itself (no pool known): NULL"); return NULL; }
+    return (NVNmemoryPool *)BF(buf)->pool; }
+NVN(nvnBufferGetMemoryOffset, ptrdiff_t, const NVNbuffer *buf) {
+    if (buf_view(buf)) { ONCE_LOG("[RED] nvnBufferGetMemoryOffset on a buffer view the game wrote itself (no pool known): 0"); return 0; }
+    return (ptrdiff_t)BF(buf)->off; }
 NVN(nvnBufferFlushMappedRange, void, const NVNbuffer *buf, ptrdiff_t off, size_t n) { (void)buf; (void)off; (void)n; }        // unified memory: nothing to flush
 NVN(nvnBufferInvalidateMappedRange, void, const NVNbuffer *buf, ptrdiff_t off, size_t n) { (void)buf; (void)off; (void)n; }
 

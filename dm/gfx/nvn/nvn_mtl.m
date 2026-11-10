@@ -15215,6 +15215,61 @@ static void present_gpu_note(double s, int fx) {
     MLOG("present command buffer GPU time over 600 presents %s: p50 %.3f ms, p95 %.3f ms, max %.3f ms", fx ? "through MetalFX" : "through the bilinear pass", a[299], a[569], a[599]);
     n[fx] = 0;
 }
+// Display-link record (diagnostic, always on: a few stores per callback): one entry per counted callback, with what the system asked for (the deadline targetTimestamp and the
+// display time targetPresentationTimestamp), what the callback did with it, and what became of the present (when its command buffer finished on the GPU, when the system showed
+// it, or that it never did). Read back on the display-link thread, 10 callbacks late so the outcomes have arrived (lk_report): every 300 callbacks a summary line, the callbacks
+// around each change of the callback's lead by about a link period (an iPhone's 30 Hz link moved between 32 and 65 ms of lead at hitches and stayed there; presents were
+// discarded only at 65: NOTES / frame-rate.md), and up to two discarded presents per summary with their neighbours. Entries are written on the display-link thread, gpu_end by
+// the commit feedback and shown by the presented handler (each checks the entry is still its own)
+#define LKN 1024
+typedef struct { _Atomic uint64_t seq; uint64_t ticket; double cb, deadline, target, commit, dur; _Atomic double gpu_end, shown; int act, depth; } lk_ev;   // act: 'P' presented, 'S' present not submitted, 'E' no frame queued, 'H' held for the previous frame's interval, 'D' tick left out (DM_LINK_DRAIN); shown: -1 = discarded
+static lk_ev g_lk[LKN]; static uint64_t g_lk_seq;
+static lk_ev *g_lk_cur;   // the entry of the callback that is in present_now (display-link thread only; NULL otherwise)
+static lk_ev *lk_get(uint64_t seq) { lk_ev *e = &g_lk[seq % LKN]; return seq && atomic_load(&e->seq) == seq ? e : NULL; }
+static void lk_line(const lk_ev *e, const lk_ev *prev) {
+    char out[160]; double ge = atomic_load(&e->gpu_end), sh = atomic_load(&e->shown);
+    if (e->act != 'P') { MLOG("  link #%llu %s: callback %+.1f ms after the one before, deadline in %.1f ms, target in %.1f ms; queue %d", (unsigned long long)atomic_load(&e->seq),
+        e->act == 'E' ? "no frame queued" : e->act == 'H' ? "held for the previous frame's interval" : e->act == 'D' ? "left out (DM_LINK_DRAIN)" : "present not submitted",
+        prev ? (e->cb - prev->cb) * 1e3 : 0.0, (e->deadline - e->cb) * 1e3, (e->target - e->cb) * 1e3, e->depth); return; }
+    if (sh < 0) snprintf(out, sizeof out, "discarded by the system"); else if (sh > 0) snprintf(out, sizeof out, "shown %+.2f ms from the target", (sh - e->target) * 1e3); else snprintf(out, sizeof out, "no presented time yet");
+    MLOG("  link #%llu present %llu: callback %+.1f ms after the one before, deadline in %.1f ms, target in %.1f ms; queue %d; committed after %.2f ms, callback took %.2f ms; GPU done %.2f ms after the callback (%+.2f from the deadline, %+.2f from the target); %s",
+         (unsigned long long)atomic_load(&e->seq), (unsigned long long)e->ticket, prev ? (e->cb - prev->cb) * 1e3 : 0.0, (e->deadline - e->cb) * 1e3, (e->target - e->cb) * 1e3, e->depth,
+         (e->commit - e->cb) * 1e3, e->dur * 1e3, ge > 0 ? (ge - e->cb) * 1e3 : -1.0, ge > 0 ? (ge - e->deadline) * 1e3 : 0.0, ge > 0 ? (ge - e->target) * 1e3 : 0.0, out);
+}
+static void lk_dump(uint64_t a, uint64_t b) { for (uint64_t s = a; s <= b; s++) { lk_ev *e = lk_get(s); if (e) lk_line(e, lk_get(s - 1)); } }
+static int lk_dcmp(const void *a, const void *b) { double x = *(const double *)a, y = *(const double *)b; return x < y ? -1 : x > y; }
+static double lk_pct(double *v, int n, int p) { if (!n) return 0; qsort(v, (size_t)n, sizeof *v, lk_dcmp); int i = n * p / 100; return v[i < n ? i : n - 1]; }
+// After each callback: seq is the callback just recorded. Everything read here is at least 10 callbacks old
+static void lk_report(uint64_t seq) {
+    static uint64_t flip_at, flip_end; static double lead_was; static int shots;
+    lk_ev *cur = lk_get(seq);
+    if (cur && cur->act == 'P') { double lead = (cur->target - cur->cb) * 1e3;   // a change of the lead by about a link period: 10 ms is under the 16.7 of a 60 Hz link's and above the jitter
+        if (lead_was > 0 && fabs(lead - lead_was) > 10) { MLOG("display link: the callback's lead before the target display time went %.1f -> %.1f ms at callback #%llu (present %llu); the callbacks around it follow in 10 ticks",
+                lead_was, lead, (unsigned long long)seq, (unsigned long long)cur->ticket); if (!flip_at) flip_at = seq; flip_end = seq; }
+        lead_was = lead; }
+    if (flip_at && seq >= flip_end + 10) { lk_dump(flip_at > 10 ? flip_at - 10 : 1, flip_end + 6); flip_at = 0; }
+    if (seq > 12) { lk_ev *o = lk_get(seq - 10);   // a discarded present with its neighbours, twice per summary at most
+        if (o && o->act == 'P' && atomic_load(&o->shown) < 0 && shots < 2) { shots++; MLOG("display link: present %llu was discarded by the system (callback #%llu):", (unsigned long long)o->ticket, (unsigned long long)(seq - 10)); lk_dump(seq - 13, seq - 7); } }
+    if (seq % 300 || seq < 320) return;
+    shots = 0;
+    static double lead[300], dl[300], gd[300], sh[300], own[2][300], nxt[2][300]; int n = 0, ne = 0, nh = 0, ng = 0, ns = 0, nd = 0, late_dl = 0, late_tg = 0, no[2] = {0, 0}, nn[2] = {0, 0}; double dmax = 0;
+    for (uint64_t s = seq - 309; s <= seq - 10; s++) { lk_ev *e = lk_get(s); if (!e) continue;
+        if (e->dur > dmax) dmax = e->dur;
+        if (e->act == 'E') ne++; else if (e->act == 'H') nh++;
+        if (e->act != 'P') continue;
+        double ge = atomic_load(&e->gpu_end), st = atomic_load(&e->shown); int c = st < 0;
+        lead[n] = (e->target - e->cb) * 1e3; dl[n] = (e->deadline - e->cb) * 1e3; n++;
+        if (ge > 0) { gd[ng++] = (ge - e->cb) * 1e3; late_dl += ge > e->deadline; late_tg += ge > e->target; if (st) own[c][no[c]++] = (e->target - ge) * 1e3; }
+        if (st > 0) sh[ns++] = (st - e->target) * 1e3; else if (st < 0) nd++;
+        for (uint64_t k = s + 1; st && k <= s + 4; k++) { lk_ev *x = lk_get(k); double xe; if (x && x->act == 'P') { if ((xe = atomic_load(&x->gpu_end)) > 0) nxt[c][nn[c]++] = (e->target - xe) * 1e3; break; } }
+    }
+    if (!n) return;
+    double l50 = lk_pct(lead, n, 50), lmin = lead[0], lmax = lead[n - 1], d50 = lk_pct(dl, n, 50), g50 = lk_pct(gd, ng, 50), g95 = ng ? gd[ng * 95 / 100] : 0, gmax = ng ? gd[ng - 1] : 0, s50 = lk_pct(sh, ns, 50);
+    MLOG("display link detail, callbacks %llu-%llu: %d presents, %d ticks with no frame queued, %d held; target display p50 %.1f / min %.1f / max %.1f ms after the callback, deadline p50 %.1f ms after it; present GPU done p50 %.2f / p95 %.2f / max %.2f ms after the callback, "
+         "%d after the deadline, %d after the target; shown p50 %+.2f / min %+.2f / max %+.2f ms from the target (%d); discarded %d; own GPU done before the target p50: shown %.1f ms, discarded %.1f ms; the next present's GPU done before this target p50: shown %.1f ms, discarded %.1f ms; longest callback %.2f ms",
+         (unsigned long long)(seq - 309), (unsigned long long)(seq - 10), n, ne, nh, l50, lmin, lmax, d50, g50, g95, gmax, late_dl, late_tg, s50, ns ? sh[0] : 0.0, ns ? sh[ns - 1] : 0.0, ns, nd,
+         lk_pct(own[0], no[0], 50), lk_pct(own[1], no[1], 50), lk_pct(nxt[0], nn[0], 50), lk_pct(nxt[1], nn[1], 50), dmax * 1e3);
+}
 static double g_link_it_tin;   // Enqueue time of the frame the display-link callback is presenting (read and written only on the display-link thread)
 static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t ticket, const int crop[4], id<CAMetalDrawable> supplied, double target_ts) {
     if (g_present_stall_ns) { struct timespec ts = {0, (long)g_present_stall_ns}; nanosleep(&ts, NULL); }
@@ -15300,14 +15355,17 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
     int fx_kind = kind == PRESENT_METALFX;
     [cb endCommandBuffer];
     MTL4CommitOptions *o = [MTL4CommitOptions new];
+    lk_ev *le = target_ts > 0 ? g_lk_cur : NULL; uint64_t ls = le ? atomic_load(&le->seq) : 0;   // this callback's display-link record (lk_report)
     [o addFeedbackHandler:^(id<MTL4CommitFeedback> f) {
         if (f.error) { MLOG("[RED] display command buffer error: %s", f.error.description.UTF8String); gpu_lost_check(f.error, "display"); }
+        if (le && atomic_load(&le->seq) == ls) atomic_store(&le->gpu_end, f.GPUEndTime);
         pthread_mutex_lock(&g_pq_mu); if (ticket > g_pq_done) g_pq_done = ticket; if (ticket > g_present_alloc_done[alloc_i]) g_present_alloc_done[alloc_i] = ticket; g_pq_inflight--; pthread_cond_broadcast(&g_pq_cv);
         present_gpu_note(f.GPUEndTime - f.GPUStartTime, fx_kind); pthread_mutex_unlock(&g_pq_mu);
     }];
     id<MTL4CommandBuffer> buffers[] = {cb};
     pthread_mutex_lock(&g_pq_mu); g_pq_inflight++; pthread_mutex_unlock(&g_pq_mu);
     [g_q4 commit:buffers count:1 options:o];
+    if (le) le->commit = CACurrentMediaTime();
     if (target_ts > 0) {
         static double leads[300], e2e[300];   // e2e: game enqueue -> system-scheduled present (including the time waiting in the queue for the display-link callback), the full span of input latency that our side can read
         static uint64_t lead_n;
@@ -15332,8 +15390,10 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
     [dr addPresentedHandler:^(id<MTLDrawable> d) {   // Actual presentation time (the time this frame is really put on screen, CACurrentMediaTime base)
         CFTimeInterval tt = d.presentedTime;
         g_pres[pn % PRING] = (pres_ent){pn, tt > 0 ? tt : -1};
+        if (le && atomic_load(&le->seq) == ls) atomic_store(&le->shown, tt > 0 ? tt : -1);
     }];
     // Each frame is displayed for at least one present period: when the GPU completion time jitters around a 120 Hz refresh boundary, the paired "25 ms + 8.33 ms" stutter no longer appears
+    // The link's drawable goes up at its target display time by the system's own schedule: presentAtTime: on it throws (CAMetalDrawableInvalidOperation, macOS 27)
     if (target_ts > 0) [dr present];
     else if (period > 0) [dr presentAfterMinimumDuration:period]; else [dr present];
 #endif
@@ -15395,16 +15455,26 @@ __attribute__((weak)) uint64_t dm_focus_in_since(void) { return 0; }
     static double cb_prev, gap_max; static int nticks;   // for g_link_ring: callbacks counted as ticks since the previous present, and the longest interval between them
     if (cb_prev > 0 && cb - cb_prev > gap_max) gap_max = cb - cb_prev;
     cb_prev = cb; nticks++;
+    uint64_t lseq = ++g_lk_seq; lk_ev *le = &g_lk[lseq % LKN];   // this callback's record (lk_report)
+    atomic_store(&le->seq, 0); le->ticket = 0; le->cb = cb; le->deadline = update.targetTimestamp; le->target = update.targetPresentationTimestamp; le->commit = le->dur = 0;
+    atomic_store(&le->gpu_end, 0); atomic_store(&le->shown, 0); le->act = 'E'; le->depth = 0; atomic_store(&le->seq, lseq);
     pthread_mutex_lock(&g_link_mu);
     __atomic_store_n(&g_link_tick_ns, now_ns(), __ATOMIC_RELAXED);
     g_link_tick_n++;
     pthread_cond_broadcast(&g_link_cv);
     pthread_mutex_unlock(&g_link_mu);
     pthread_mutex_lock(&g_pq_mu);
-    if (!g_dm_present_link || g_rescue_mode || g_pq_read == g_pq_in) { if (g_dm_present_link && !g_rescue_mode) g_link_empty++; pthread_mutex_unlock(&g_pq_mu); return; }
+    le->depth = (int)(g_pq_in - g_pq_read);
+    if (!g_dm_present_link || g_rescue_mode || g_pq_read == g_pq_in) { if (g_dm_present_link && !g_rescue_mode) g_link_empty++; pthread_mutex_unlock(&g_pq_mu); lk_report(lseq); return; }
     // The previous frame's present interval was >= 2 (period > 25 ms): keep it on screen for its whole period before taking the next one, as the Switch flips only every N vertical syncs. This also holds while the link runs at 60 Hz (Mario 1.2.1 sets 2 for single frames, see nvn_game_fps in hle_nvn.c);
     //   before, every tick took the newest frame, so that frame, carrying the extra time step the game advanced for it, was shown for only 16.7 ms and the game looked like it jumped ahead
-    if (g_link_hold_until > 0 && update.targetPresentationTimestamp < g_link_hold_until - tol) { g_link_held++; pthread_mutex_unlock(&g_pq_mu); return; }
+    if (g_link_hold_until > 0 && update.targetPresentationTimestamp < g_link_hold_until - tol) { g_link_held++; pthread_mutex_unlock(&g_pq_mu); le->act = 'H'; lk_report(lseq); return; }
+    // DM_LINK_DRAIN=1 (an experiment, off by default): once the callback has run more than 1.75 of its own intervals ahead of the target display time for 60 presents in a row,
+    // one tick takes no frame, as a tick with no frame queued does. For the iPhone's 65 ms lead (lk_report): every return to 32 ms in the logs came with such ticks
+    { static int drain = -1, far; static double cb_was; if (drain < 0) { const char *e = getenv("DM_LINK_DRAIN"); drain = e && atoi(e) > 0; if (drain) MLOG("display link: one tick left out after 60 presents called back more than 1.75 intervals ahead (DM_LINK_DRAIN)"); }
+      double itv = cb_was > 0 ? cb - cb_was : 0; cb_was = cb;
+      far = itv > 0 && update.targetPresentationTimestamp - cb > 1.75 * itv ? far + 1 : 0;
+      if (drain && far >= 60) { far = 0; pthread_mutex_unlock(&g_pq_mu); le->act = 'D'; MLOG("display link: tick left out at callback #%llu, %.1f ms ahead of its target (DM_LINK_DRAIN)", (unsigned long long)lseq, (update.targetPresentationTimestamp - cb) * 1e3); lk_report(lseq); return; } }
     uint64_t first = g_pq_read + 1, ticket = g_pq_in;
     // In order, one frame per tick and at most one behind the newest: two waiting, the older now and the newer on the next tick; three or more, the older ones are dropped. Taking the newest
     // dropped the one before whenever two frames landed in the same refresh, as frames of a 60 fps game that take 16-17.5 ms do, and the next frame then stayed up 33 ms
@@ -15420,7 +15490,9 @@ __attribute__((weak)) uint64_t dm_focus_in_since(void) { return 0; }
     pthread_mutex_unlock(&g_pq_mu);
     int submitted;
     ext_wait(it.ev_val); snap_commit_wait(it.snap_v);
+    le->ticket = ticket; le->act = 'P'; g_lk_cur = le;
     @autoreleasepool { submitted = present_now(&it.t, it.period, it.frame, ticket, it.crop, update.drawable, update.targetPresentationTimestamp); mtl_tex_unpin(it.t.serial); }
+    g_lk_cur = NULL; if (!submitted) le->act = 'S'; le->dur = CACurrentMediaTime() - cb; lk_report(lseq);
     g_link_hold_until = submitted && it.period > 0.025 ? update.targetPresentationTimestamp + it.period : 0;
     if (!submitted) {
         pthread_mutex_lock(&g_pq_mu);
@@ -15478,7 +15550,7 @@ static void *link_main(void *arg) {   // Display link thread: started when switc
     NvMetalDisplayLinkDelegate *delegate = [NvMetalDisplayLinkDelegate new];
     CAMetalDisplayLink *link = [[CAMetalDisplayLink alloc] initWithMetalLayer:layer];
     link.preferredFrameRateRange = link_range(g_link_mode);
-    link.preferredFrameLatency = link_latency(); MLOG("display link: frame latency %d (%s)", link_latency(), link_latency_why());
+    link.preferredFrameLatency = link_latency(); MLOG("display link: frame latency %d (%s); the screen's highest rate %d Hz", link_latency(), link_latency_why(), mtl_display_hz());
     link.delegate = delegate;
     [link addToRunLoop:[NSRunLoop currentRunLoop] forMode:NSDefaultRunLoopMode];
     g_link_rl = CFRunLoopGetCurrent(); g_link = link;
