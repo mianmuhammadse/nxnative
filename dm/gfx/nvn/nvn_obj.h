@@ -50,7 +50,10 @@ _Static_assert(sizeof(view_t) <= 16, "view_t exceeds the newer SDKs' NVNtextureV
 // Sampler parameters (one copy shared by builder and object)
 typedef struct { uint8_t minf, magf, ws, wt, wr, cmp_mode, cmp_func, reduction; float lod_min, lod_max, lod_bias, aniso, border[4]; } samp_par;   // Enum values are all < 256; reduction takes the padding byte
 typedef struct { NVNdevice *dev; samp_par p; } samp_builder_t;                                FITS(samp_builder_t, NVNsamplerBuilder);
-typedef struct { uint32_t magic; samp_par p; } samp_t;                                        FITS(samp_t, NVNsampler);
+// All of the state lies from byte 8 on, and nvnSamplerInitialize writes every byte of the record (docs/reference/nvn-objects.md): games hash a sampler from byte 8 to tell samplers apart. Super Mario Odyssey's sampler cache
+// (main+0x980e20) keys its entries by a CRC-16 of bytes 8-0x5f alone and reuses the ID of the entry whose CRC matches, so filter and wrap modes at bytes 4-7 made samplers that differ only in them one sampler
+typedef struct { uint32_t magic, zero; samp_par p; } samp_t;                                  FITS(samp_t, NVNsampler);
+_Static_assert(__builtin_offsetof(samp_t, p) == 8 && sizeof(samp_par) == 40, "sampler state from byte 8, with no padding");
 
 // The per-stage shader keys are not kept in prog_t: the game's real NVNprogram may be smaller than the header's 0xC0 (growing prog_t corrupted the adjacent object in Mario); see prog_keys in hle_nvn.c
 typedef struct { uint32_t magic, nstage; NVNshaderData sd[6]; uint64_t serial; } prog_t;     FITS(prog_t, NVNprogram);   // serial: table key for the replay layer's resolved result
@@ -59,10 +62,11 @@ typedef struct { uint32_t magic, fenced; uint64_t fence; } sync_t;   /* fenced 1
 typedef struct { const pool_t *pool; int64_t off; } ev_builder_t;                             FITS(ev_builder_t, NVNeventBuilder);
 typedef struct { uint32_t magic; volatile uint32_t *val; const pool_t *pool; int64_t off; } ev_t; FITS(ev_t, NVNevent);   // pool / off: EventGetMemoryPool / Offset
 
-typedef struct { NVNdevice *dev; void *native; int32_t ntex, interval; NVNtexture *tex[4]; } win_builder_t;
+// nactive: SetNumActiveTextures, the first textures AcquireTexture hands out (0 = all of them)
+typedef struct { NVNdevice *dev; void *native; int32_t ntex, interval; NVNtexture *tex[4]; int32_t nactive; } win_builder_t;
 FITS(win_builder_t, NVNwindowBuilder);
 // avail[i]: time at which swapchain image i can be acquired again (ns, monotonic clock) = its display time + one present period; pace: target time of this window's present pacer
-typedef struct { uint32_t magic; void *native; int32_t ntex, interval, next, crop[4]; NVNtexture *tex[4]; uint64_t presents, avail[4], pace, ticket[4]; } win_t;   // ticket[i]: ticket of the most recent present of image i
+typedef struct { uint32_t magic; void *native; int32_t ntex, interval, next, crop[4]; NVNtexture *tex[4]; uint64_t presents, avail[4], pace, ticket[4]; int32_t nactive; } win_t;   // ticket[i]: ticket of the most recent present of image i; nactive as in win_builder_t
 FITS(win_t, NVNwindow);
 
 // Command buffer: commands are written into the command memory given by the game (AddCommandMemory), handle = segment start address; when it runs out, the game is called back for more memory
@@ -80,6 +84,7 @@ typedef struct {
     int32_t tex_base, samp_base;         // Host-table bases of the texture / sampler pool this command buffer last bound (hle_nvn.c dpool_add; 0 = the first pool of its kind)
     size_t ctl_size;                     // Bytes in the last control memory block supplied by the game (the host records no control commands)
     int64_t copy_row, copy_image;        // SetCopyRowStride / SetCopyImageStride: state of the command buffer, written into each buffer <-> texture copy (p_copy_strides), not recorded
+    size_t cmd_size;                     // GetCommandMemorySize: the bytes the game last passed to AddCommandMemory, as in NVN; a host-lent segment leaves it (see there)
 } cmd_t;                                                                                   FITS(cmd_t, NVNcommandBuffer);
 
 // ---------- State objects (defaults follow the NVN / GL defaults) ----------
@@ -260,6 +265,7 @@ void mtl_tex_unpin(uint64_t serial);
 void mtl_pkg_stats(uint64_t *uploads, uint64_t *reuploads);
 unsigned mtl_cpu_tex_count(void);   // live textures the CPU writes (retired snapshots are excluded)
 uint64_t mtl_pkg_edge_skips(void);   // packaged texture checks that found only writes beside the texture (pkg_edges_clean)
+uint64_t mtl_pkg_copy_absorbs(void);   // GPU copies into a packaged texture whose bytes, written into its storage too, were not taken as a change to upload (pkg_copy_absorb)
 uint64_t mtl_pkg_miss(void);
 uint64_t mtl_upload_ns_take(void);   // Take and zero: time spent uploading packaged textures on the submit thread since last time   // DM_NVN_DIRTYCHECK diagnostic: number of missed detections   // Packaged textures: number of first uploads, number of re-uploads due to pool content changes
 uint64_t mtl_upload_gpu_ns_take(void);   // Take and zero: GPU execution time of upload command buffers (sum of GPUEndTime − GPUStartTime)
@@ -278,8 +284,12 @@ enum { MTL_REWRITE_UPLOADED, MTL_REWRITE_GPU, MTL_REWRITE_GPU_NOW };     // mtl_
 int mtl_tex_cpu_rewritten(const tex_t *t);                               // nvn_ft_poll: the CPU wrote a registered texture's pages after its first use (MTL_REWRITE_*)
 // hle_nvn.c: a texture tex_flush_upload / tex_dirty_upload registered and has not resolved yet; GPU copies written into the destination texture's storage as well (see there)
 int nvn_ft_tracked(uint64_t serial);
-int nvn_tex_mirror_b2t(const tex_t *t, unsigned level, unsigned layer0, const NVNcopyRegion *r, const uint8_t *src, size_t row, size_t img);
-int nvn_tex_mirror_t2t(const tex_t *s, unsigned sl, unsigned ss, const NVNcopyRegion *sr, const tex_t *d, unsigned dl, unsigned ds, const NVNcopyRegion *dr);
+// The storage ranges a copy's mirror made writable and wrote, as addresses [lo, hi): the host's own write, which pkg_copy_absorb (nvn_mtl.m) excepts. The caller sets n = 0;
+// n = −1 when there were more than fit (that copy is then not absorbed)
+typedef struct { int n; uintptr_t r[64][2]; } mspan_t;
+int nvn_tex_mirror_b2t(const tex_t *t, unsigned level, unsigned layer0, const NVNcopyRegion *r, const uint8_t *src, size_t row, size_t img, mspan_t *ms);
+int nvn_tex_mirror_t2t(const tex_t *s, unsigned sl, unsigned ss, const NVNcopyRegion *sr, const tex_t *d, unsigned dl, unsigned ds, const NVNcopyRegion *dr, mspan_t *ms);
+int nvn_tex_level_range(const tex_t *t, unsigned level, unsigned layer, uint64_t *lo, uint64_t *hi);   // one level of one layer in the texture's storage, as offsets; −1 out of range
 // A program's per-stage shader key (hle_nvn.c): the first 8 bytes of sha256(first 0x880 bytes of the control section (its own length when shorter) + code area). Computed at SetShaders (NVN lets the caller free the control section once it returns, and Unity does);
 // a stage whose code area was not yet in any memory pool then is computed the first time it is asked for, from the host's copy of its control section. The keys belong to
 // the program's serial, so a copy of the NVNprogram the game made after SetShaders finds them. Returns 0 = no such stage
