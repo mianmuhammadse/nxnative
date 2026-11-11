@@ -37,12 +37,10 @@ static void read_back(id<MTLTexture> t, uint8_t out[64]) {   // 2x2 ASTC blocks 
 int main(void) {
     setenv("DM_TEST_NO_BC", "1", 1);
     mtl_init(); mtl_sub_begin();
-    {   // BC3 and ASTC both have 16-byte blocks: a byte-size check alone must not permit a native-BC storage mirror.
-        tex_t desc = {0}; desc.d.format = 0x44; desc.d.width = desc.d.height = 8;
-        NVNcopyRegion region = {0}; region.width = region.height = 8; region.depth = 1;
-        id<MTLTexture> t = new_astc(); int before = g_npost;
-        mirror_readback(&desc, t, 0, 0, &region, "texture", 0);
-        CHECK(g_npost == before, "ASTC blocks were queued for readback into BC3 storage");
+    {   // BC3 and ASTC both have 16-byte blocks: a byte-size check alone must not permit a store of the host texture into BC3 storage (gsb_store; upstream's GPU write-back replaced mirror_readback)
+        tex_t desc = {0}; desc.d.format = 0x44; desc.d.width = desc.d.height = 8; desc.d.depth = 1; desc.d.levels = 1;
+        id<MTLTexture> t = new_astc();
+        CHECK(!gsb_host_ok(&desc, t), "an ASTC stand-in of a BC3 texture was accepted as holding the BC3 storage's bytes");
     }
     // four BC3 blocks with varying alpha, and what they transcode to
     uint8_t bc[4][16], want[64]; uint32_t s = 12345;
