@@ -92,6 +92,20 @@ static void t_npads(void) {
     CHECK(buttons_of(0, STYLE_FULLKEY) == (DM_BTN_X | DM_BTN_A) && lx_of(0) == -200, "keyboard and player 1's controller are ORed, the stick deflected more wins");
     dm_input_set(0, 0, 0, 0, 0); dm_pad_set(0, 0, 0, 0, 0); buttons_of(0, STYLE_FULLKEY);
 
+    // The console's mode changes: player 1's controller moves between No1 and Handheld, and a game that reads it only after its style event must hear of it (Link's Awakening
+    // in handheld mode saw no controller and opened the controller applet again and again). Both events are bound (the Handheld one too); each mode change signals both
+    {
+        static uint8_t evn[0x40], evh[0x40]; g_signals = 0;
+        h_hid_BindStyleEv(&(uint32_t){0}, evn, 0); h_hid_BindStyleEv(&(uint32_t){NPAD_HANDHELD}, evh, 0);
+        CHECK(atomic_load(&g_style_ev_hh) == (void *)evh, "the Handheld npad's style event is bound");
+        g_signals = 0; g_mode = 0; hle_hid_opmode_changed();
+        CHECK(g_signals == 2, "docked -> handheld signals No1's and Handheld's style events");
+        CHECK(h_hid_GetStyle(&(uint32_t){NPAD_HANDHELD}) == STYLE_HANDHELD && h_hid_GetStyle(&(uint32_t){0}) == 0, "in handheld mode the controller is the Handheld npad's");
+        g_signals = 0; g_mode = 1; hle_hid_opmode_changed();
+        CHECK(g_signals == 2, "handheld -> docked signals them again");
+        atomic_store(&g_style_ev[0], NULL); atomic_store(&g_style_ev_hh, NULL); g_signals = 0;
+    }
+
     // Two controllers: player 2 on No2 with its own input, the style event of No2 signalled
     static uint8_t ev1[0x40];
     h_hid_BindStyleEv(&(uint32_t){1}, ev1, 0);

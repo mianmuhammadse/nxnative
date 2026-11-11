@@ -52,10 +52,12 @@ static void mq_push_(uint32_t m) {
     pthread_cond_broadcast(&g_mq_cond);
     pthread_mutex_unlock(&g_mq_lock);
 }
+__attribute__((weak)) void (*dm_opmode_hook)(void) = 0;   // set by hle_hid.c (also defined there, weak, so a test that links only one of them still links): the controller moves between No1 and Handheld, its style events are signalled
 void dm_set_opmode(int m) {   // called by the front end (overheat downgrade etc.): change the state and push 30 / 31 according to the switches the game has turned on
     int old = dm_opmode(); if (old == m) return;
     g_opmode = m;
     LOG("oe operation mode %d → %d", old, m);
+    if (dm_opmode_hook) dm_opmode_hook();
     if (g_ntf_opmode) mq_push(MSG_OPMODE);
     if (g_ntf_perfmode) mq_push(MSG_PERFMODE);
 }

@@ -360,8 +360,14 @@ static int32_t pick(int32_t a, int32_t b) { return (a < 0 ? -a : a) >= (b < 0 ? 
 
 // Style update events bound per npad (BindNpadStyleSetUpdateEvent, No1..No8 by id): signalled when a player's controller comes or goes, as the hid
 // service does. The front end reports from its own thread, where an event cannot be bound, so only a bound one is signalled (one the game destroyed is not bound any more)
-static void *_Atomic g_style_ev[DM_PLAYERS];
-static void style_changed(uint32_t id) { void *ev = id < DM_PLAYERS ? atomic_load(&g_style_ev[id]) : NULL; if (ev) hle_signal_bound_system_event(ev); }
+static void *_Atomic g_style_ev[DM_PLAYERS], *_Atomic g_style_ev_hh;   // No1..No8 and Handheld
+static void style_changed(uint32_t id) { void *ev = id < DM_PLAYERS ? atomic_load(&g_style_ev[id]) : id == NPAD_HANDHELD ? atomic_load(&g_style_ev_hh) : NULL; if (ev) hle_signal_bound_system_event(ev); }
+// A change of the console's mode moves player 1's controller between No1 (docked) and Handheld (connected_id, style_of) and changes what each reports, as the hid service does
+// when the console is docked or undocked: every bound style event is signalled. A game that reads its controller only after the event (Link's Awakening) kept reading the npad
+// it had chosen before, found it empty in handheld mode, and opened the controller applet again and again (hle_oe.c dm_set_opmode calls it through dm_opmode_hook)
+void hle_hid_opmode_changed(void) { for (uint32_t i = 0; i < DM_PLAYERS; i++) style_changed(i); style_changed(NPAD_HANDHELD); }
+__attribute__((weak)) void (*dm_opmode_hook)(void) = 0;
+__attribute__((constructor)) static void hid_opmode_hook_init(void) { dm_opmode_hook = hle_hid_opmode_changed; }
 // Joy-Cons as devices (dm_input.h): which a pad holds, then each one's buttons and stick. The style events tell the game that its npads changed
 void dm_joy_attach(int p, uint32_t sides) {
     if (p < 0 || p >= DM_PLAYERS) return;
@@ -1118,7 +1124,7 @@ HLE_FORCE("_ZN2nn3hid23MergeSingleJoyAsDualJoyERKjS2_", "merge single Joy-Cons; 
 HLE_FORCE("_ZN2nn3hid27BindNpadStyleSetUpdateEventERKjPNS_2os15SystemEventTypeENS3_14EventClearModeE", "controller style update event: bound, signaled once for a connected controller and on connect / disconnect", void, h_hid_BindStyleEv,
           const uint32_t *id, void *ev, int clear) {
     hle_bind_system_event(ev, clear);
-    if (*id < DM_PLAYERS) atomic_store(&g_style_ev[*id], ev);
+    if (*id < DM_PLAYERS) atomic_store(&g_style_ev[*id], ev); else if (*id == NPAD_HANDHELD) atomic_store(&g_style_ev_hh, ev);
     if (style_of(*id)) hle_signal_system_event(ev);
 }
 // The Switch's player LEDs by npad (No1 1, No2 1-2, No3 1-3, No4 1-4, No5 1+4, No6 1+3, No7 1+3+4, No8 2+3; bit 0 = LED 1); Handheld and Other light LED 1 as before
