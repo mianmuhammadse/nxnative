@@ -47,7 +47,7 @@ int main(void) { @autoreleasepool {
         CHECK(cb.status == MTLCommandBufferStatusCompleted, "the texture takes its non-zero depth");
         res_add(base);
         state_reset(); memset(&R, 0, sizeof R); mtl_sub_begin();
-        tex_zero_fill(base);
+        tex_zero_fill(base, 0);
         int pieces0 = 0; for (int k = 0; k < g_nup_blits; k++) pieces0 += g_up_blits[k].dst == base && g_up_blits[k].slice == 0 && g_up_blits[k].level == 0 && !g_up_blits[k].tsrc;
         CHECK(pieces0 == (int)cases[i].pieces, "level 0 of a layer is zeroed by the expected number of copies, with no render pass");
         mtl_sub_commit(); mtl_drain();
