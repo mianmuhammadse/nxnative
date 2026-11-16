@@ -12,6 +12,7 @@
 #include <TargetConditionals.h>
 #include <mach/mach.h>
 #include <mach/vm_statistics.h>
+#include <stdatomic.h>
 #if TARGET_OS_IPHONE
 #include <os/proc.h>
 #endif
@@ -149,15 +150,13 @@ static void *memstat_thread(void *p) {
     return NULL;
 }
 
-// Called from dm_main once the environment is final (on iOS main.m has read env.txt by then; a constructor would run before main and see none of it)
-void dm_memstat_start(void) {
+static void memstat_start(void) {
     const char *p = getenv("DM_MEMSTAT");
     if (!p || !*p) return;
     char *path = strdup(p);
 #if TARGET_OS_IPHONE
-    if (*p != '/') { size_t n = strlen(getenv("HOME")) + strlen(p) + 16; path = malloc(n); snprintf(path, n, "%s/Documents/%s", getenv("HOME"), p); }   // Relative name → the container's Documents
+    if (*p != '/') { size_t n = strlen(getenv("HOME")) + strlen(p) + 16; path = malloc(n); snprintf(path, n, "%s/Documents/%s", getenv("HOME"), p); }   // Relative name → the container's Documents (the container path is not known before launch)
 #endif
-    LOG("memstat: writing %s", path);
     pthread_t th; pthread_create(&th, NULL, memstat_thread, path); pthread_detach(th);
 }
 
@@ -168,7 +167,7 @@ void dm_memstat_start(void) {
 #define THR_MAX 512
 static void *thrcpu_thread(void *p) {
     char path[1024]; int iv = 10; { const char *c = strchr((const char *)p, ','); snprintf(path, sizeof path, "%.*s", c ? (int)(c - (const char *)p) : (int)strlen(p), (const char *)p); if (c) iv = atoi(c + 1); }
-    FILE *f = fopen(path, "w"); if (!f) { LOG("thrcpu: cannot open %s", path); return NULL; }
+    FILE *f = fopen(path, "w"); if (!f) return NULL;
     fprintf(f, "seconds\tthread ID\tthread name\tCPU%%\n"); fflush(f);
     static uint64_t ids[THR_MAX], last[THR_MAX]; int n = 0; uint64_t t0 = now_ns(), tl = t0;
     for (;;) {
@@ -193,7 +192,7 @@ static void *thrcpu_thread(void *p) {
     }
     return NULL;
 }
-void dm_thrcpu_start(void) {
+static void thrcpu_start(void) {
     const char *p = getenv("DM_THRCPU");
     if (!p || !*p) return;
     char *spec = strdup(p);
@@ -201,4 +200,11 @@ void dm_thrcpu_start(void) {
     if (*p != '/') { size_t n = strlen(getenv("HOME")) + strlen(p) + 16; spec = malloc(n); snprintf(spec, n, "%s/Documents/%s", getenv("HOME"), p); }
 #endif
     pthread_t th; pthread_create(&th, NULL, thrcpu_thread, spec); pthread_detach(th);
+}
+// DM_MEMSTAT and DM_THRCPU, started once by the host's loading (main.c host_preload), not by a constructor: on iOS a constructor runs before the app's main() sets what Documents/env.txt
+// holds, so either switch set there did nothing (GitHub issue #1184)
+void dm_diag_samplers_start(void) {
+    static atomic_int once;
+    if (atomic_exchange(&once, 1)) return;
+    memstat_start(); thrcpu_start();
 }
