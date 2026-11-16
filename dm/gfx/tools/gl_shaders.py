@@ -5,9 +5,10 @@
 #   · MVGL archives (*.mvgl, dm/gfx/tools/mvgl.py): every .shad file, named <material>_vp / <material>_fp (1,682 files, 615 distinct sources in Digimon);
 #   · an NSO (a file that starts with NSO0, the game's main): every NUL-terminated string that starts with '#version' (its built-in post effects, movie and shadow shaders);
 #   · capture folders (the Mac host's DM_GL_CAPTURE): <key>.vert / <key>.frag, what the game really compiled, for sources it puts together at run time.
+#   · loose source files: *.vert / *.frag, and *.glsl, whose name says nothing of its stage (Mega Man Legacy Collection's shaders/nx/*.glsl, read and compiled as they are).
 # Per shader:
 #   · key = sha256(the source text up to its first NUL)[:16] (hex), as the host hashes the strings glShaderSource gets; the Metal function is gl_<key>_v or gl_<key>_f;
-#   · the stage: a capture's extension, an archive file's _vp / _fp; a string in main says nothing of its stage, so it is translated as each stage that compiles (one of
+#   · the stage: a capture's extension, an archive file's _vp / _fp; a string in main or a .glsl file says nothing of its stage, so it is translated as each stage that compiles (one of
 #     Digimon's built-in fragment shaders names gl_Position in a #define);
 #   · GLSL → SPIR-V with glslang (-V -R: relaxed Vulkan rules, which gather the loose uniforms into one block, gl_DefaultUniformBlock; --aml / --amb number the inputs,
 #     outputs and bindings), SPIR-V → MSL with spirv-cross (--msl-decoration-binding: Metal slots = those bindings; vertex shaders --fixup-clipspace: GL's z from −w to w → 0 to w);
@@ -18,6 +19,7 @@
 #   a:<name>=<slot>:<type>                       a vertex input, [[attribute(slot)]]
 #   u:<name>=<offset>:<type>:<count>:<stride>    a member of the default uniform block (count 0 = not an array)
 #   b:<slot>:<size>                              the default uniform block: its buffer slot and size in bytes
+#   n:<name>=<slot>:<size>                       a named uniform block (DOOM 3's matrices_ubo): its buffer slot and size in bytes
 #   t:<name>=<slot>:<type>                       a combined sampler: texture and sampler slot
 #   o:<name>=<location>                          a fragment output, [[color(location)]]
 # <TAB> where it came from
@@ -38,13 +40,18 @@ def text_of(b):
     b = bytes(b); z = b.find(b'\0')
     return b[:z] if z >= 0 else b
 
+# A whole shader defines its entry point. DOOM 3's main holds two '#version 150' strings that are not shaders but the prefix its renderer puts before the GLSL it
+# generates from its render programs at run time (helper functions, no main): those are left to the capture (dm/games/profile_guess.py GL_ENTRY, the same rule)
+GL_ENTRY = re.compile(rb'\bvoid\s+main\s*\(')
+
 def nso_strings(path):
-    """'#version <number>' strings of an NSO's read-only segment (dm/tools/nso.py); a main that links glslang (Balatro's LÖVE) also has its messages that start with '#version:'.
-    nso.Error (a ValueError) on a damaged file"""
+    """'#version <number>' strings of an NSO's read-only segment (dm/tools/nso.py) that are whole shaders (GL_ENTRY); a main that links glslang (Balatro's LÖVE) also has its
+    messages that start with '#version:'. nso.Error (a ValueError) on a damaged file"""
     import nso
     with open(path, 'rb') as f: m = nso.load(f.read(), path)
     (mo, sz) = m.segments[1]; img = bytes(m.image[mo:mo + sz])
-    return [text_of(img[m.start():m.start() + 0x10000]) for m in re.finditer(rb'(?:^|(?<=\0))#version [0-9]', img)]
+    texts = (text_of(img[m.start():m.start() + 0x10000]) for m in re.finditer(rb'(?:^|(?<=\0))#version [0-9]', img))
+    return [t for t in texts if GL_ENTRY.search(t)]
 
 def sources(roots):
     """(source bytes, stage or None, where) for every shader in the input paths"""
@@ -64,14 +71,22 @@ def sources(roots):
                         if not nm.endswith('.shad'): continue
                         st = 'vert' if nm.endswith('_vp.shad') else 'frag' if nm.endswith('_fp.shad') else None
                         yield text_of(a.read(nm)), st, f'/{os.path.relpath(p, r)}:{nm}'
-                elif fn.endswith(('.vert', '.frag')):
+                elif fn.endswith(('.vert', '.frag', '.glsl')):
                     with open(p, 'rb') as f: source = text_of(f.read())
-                    yield source, fn.rsplit('.', 1)[1], '/' + os.path.relpath(p, r)
+                    ext = fn.rsplit('.', 1)[1]
+                    yield source, None if ext == 'glsl' else ext, '/' + os.path.relpath(p, r)
 
 # NVIDIA's GLSL compiler accepts more than the GLSL ES 3.20 specification, and glslang does not; these fix-ups run on the preprocessed text (glslang -E, so macros are expanded):
 #   · the GLSL ES 1.0 texture functions (89 of Digimon's fragment shaders call textureCube; with -V glslang reads textureCube as Vulkan's texture type, so a macro cannot rename it);
 #   · a redeclaration of gl_Position as a plain output (the built-in sprite shader of main declares `out float4 vPosition;` with vPosition defined as gl_Position);
-#   · textureOffset with an offset that is not a constant (the built-in FXAA shader): Metal's sample offsets are constants too, so it becomes texture at P + offset / level 0 size
+#   · textureOffset with an offset that is not a constant (the built-in FXAA shader): Metal's sample offsets are constants too, so it becomes texture at P + offset / level 0 size;
+#   · built-ins redeclared as plain inputs and outputs, which DOOM 3's renderer writes into every GLSL 1.50 shader it generates (`out vec4 gl_Position;`, `in vec4 gl_FragCoord;`,
+#     `out float gl_FragDepth;`): the declarations go, the built-ins stay; `out vec4 gl_FragColor;` becomes a plain output of the shader's own (Vulkan GLSL has no gl_FragColor);
+#   · the compatibility colour declared as a plain varying, `out vec4 gl_FrontColor;` in the vertex shader and `in vec4 gl_Color;` in the fragment shader (DOOM 3): NVIDIA links the two
+#     as GL's fixed pipeline does, so both become one varying, dm_Color, which the host matches by name;
+#   · `sampler` as a name (DOOM 3's helpers take `sampler2D sampler`): a reserved word in Vulkan GLSL, an ordinary name in OpenGL's;
+#   · a function body closed with `};` (Mega Man Legacy Collection's shaders/nx/*.glsl end main that way): GLSL ES has no empty declaration at file scope, so the `;` goes.
+#     A struct's or a block's `};` ends its declaration and stays: only a `{` opened right after a `)` at file scope is a function body
 OLD_TEX = [(r'\btexture2DLod\s*\(', 'textureLod('), (r'\btextureCubeLod\s*\(', 'textureLod('), (r'\btexture2DProj\s*\(', 'textureProj('),
            (r'\btexture2D\s*\(', 'texture('), (r'\btextureCube\s*\(', 'texture(')]
 
@@ -87,9 +102,39 @@ def call_args(t, i):
         elif c == ',' and depth == 1: args.append(t[start:k]); start = k + 1
     raise ValueError('unbalanced parentheses')
 
-def fixups(t):
+BUILTIN_DECL = r'^[ \t]*(?:invariant\s+)?(?:in|out)\s+(?:highp\s+|mediump\s+|lowp\s+)?(?:vec4|float)\s+gl_(?:Position|FragCoord|FragDepth|PointSize)\s*;'
+
+def own_name(t, decl, name, new, out=None):
+    """t with a built-in the shader declares as a plain varying (decl matches the declaration) renamed to a variable of its own; out: the declaration to put in its place"""
+    if not re.search(decl, t, flags=re.M): return t
+    t = re.sub(decl, out or '', t, flags=re.M)
+    return re.sub(rf'\b{name}\b', new, t)
+
+def function_semicolons(t):
+    """t without the `;` right after the `}` that closes a function body at file scope"""
+    out, depth, body, i, k = [], 0, False, 0, 0
+    while k < len(t):
+        c = t[k]
+        if c == '{':
+            if depth == 0: body = t[:k].rstrip().endswith(')')
+            depth += 1
+        elif c == '}' and depth:
+            depth -= 1
+            if depth == 0 and body:
+                m = re.match(r'\s*;', t[k + 1:])
+                if m: out.append(t[i:k + 1]); i = k + 1 + m.end(); k = i; continue
+        k += 1
+    return ''.join(out) + t[i:]
+
+def fixups(t, stage):
+    t = function_semicolons(t)
     for a, b in OLD_TEX: t = re.sub(a, b, t)
-    t = re.sub(r'^[ \t]*out\s+(?:highp\s+|mediump\s+|lowp\s+)?vec4\s+gl_Position\s*;', '', t, flags=re.M)
+    t = re.sub(BUILTIN_DECL, '', t, flags=re.M)
+    t = re.sub(r'\bsampler\b', 'dm_sampler', t)
+    if stage == 'vert': t = own_name(t, r'^[ \t]*out\s+vec4\s+gl_FrontColor\s*;', 'gl_FrontColor', 'dm_Color', 'out vec4 dm_Color;')
+    else:
+        t = own_name(t, r'^[ \t]*in\s+vec4\s+gl_Color\s*;', 'gl_Color', 'dm_Color', 'in vec4 dm_Color;')
+        t = own_name(t, r'^[ \t]*out\s+vec4\s+gl_FragColor\s*;', 'gl_FragColor', 'dm_FragColor', 'out vec4 dm_FragColor;')
     out, i = [], 0
     for m in re.finditer(r'\btextureOffset\s*\(', t):
         if m.start() < i: continue
@@ -142,7 +187,7 @@ def translate(src, stage, key, tmp):
     r = subprocess.run(['glslangValidator', '-E', '-S', stage, g + '.in'], capture_output=True, text=True)
     if r.returncode: return 'glslang -E: ' + ' | '.join(l for l in (r.stdout + r.stderr).splitlines() if 'ERROR' in l and 'compilation' not in l)[:400]
     pre = r.stdout[r.stdout.find('#version'):]   # warnings come first
-    open(g, 'w').write(fixups(pre))
+    open(g, 'w').write(fixups(pre, stage))
     r = subprocess.run(['glslangValidator', '-V', '-R', '--aml', '--amb', '-S', stage, g, '-o', spv], capture_output=True, text=True)
     if r.returncode: return 'glslang: ' + ' | '.join(l for l in (r.stdout + r.stderr).splitlines() if 'ERROR' in l and 'compilation' not in l)[:400]
     refl = json.loads(subprocess.run([SPIRV_CROSS, spv, '--reflect'], capture_output=True, text=True, check=True).stdout)
@@ -164,11 +209,17 @@ def translate(src, stage, key, tmp):
     bools = {n for n in re.findall(r'\buniform\s+(?:(?:lowp|mediump|highp)\s+)?bool\s+(\w+)\s*;', pre)}
     for u in refl.get('ubos', []):
         t = refl['types'][u['type']]
-        if t['name'] != 'gl_DefaultUniformBlock': return f'uniform block {t["name"]} is not the default block'
+        if t['name'] != 'gl_DefaultUniformBlock':   # a named block: the buffer the game binds to its binding point (glUniformBlockBinding, glBindBufferRange)
+            if u.get('array'): return f'uniform block {t["name"]}: arrays of blocks are not implemented'
+            f.append(f'n:{t["name"]}={u["binding"]}:{u["block_size"]}'); continue
         f.append(f'b:{u["binding"]}:{u["block_size"]}')
         e = uni_members(refl, t['members'], '', 0, f, bools)
         if e: return e
+    # the samplers the MSL takes: spirv-cross leaves out one the shader never reads, but its reflection still lists it, and glslang gives it the binding of a used one (Mega Man Legacy
+    # Collection's default_ps.glsl declares T1 for code under #if 0: T0 and T1 both at 0). Listed, the host bound the unit T1 names, an empty one, over T0's texture: every sprite sampled black
+    used = set(re.findall(r'\b(\w+)\s*\[\[texture\(\d+\)\]\]', m))
     for t in refl.get('textures', []):
+        if t['name'] not in used: continue
         if t.get('array'): return f'sampler array {t["name"]}'
         f.append(f't:{t["name"]}={t["binding"]}:{t["type"]}')
     for k in ('separate_images', 'separate_samplers', 'images', 'ssbos', 'push_constants'):
@@ -220,7 +271,7 @@ def main():
         for key, where, errs in failed:
             if not any(k == key for k, _ in seen): print(f'[RED] {where} ({key}) does not translate: {" / ".join(errs)}')
         tsv = ['# GL shaders (dm/gfx/tools/gl_shaders.py): key = sha256(GLSL source)[:16], Metal function gl_<key>_v / gl_<key>_f; a: vertex inputs, u: default uniform block members '
-               '(offset:type:count:stride), b: the block (slot:size), t: combined samplers (slot:type), o: fragment outputs',
+               '(offset:type:count:stride), b: the block (slot:size), n: named blocks (name=slot:size), t: combined samplers (slot:type), o: fragment outputs',
                '# ' + ' '.join(subprocess.run(['glslangValidator', '--version'], capture_output=True, text=True).stdout.split()[:3]) + '; spirv-cross '
                + ' '.join((lambda r: r.stdout + r.stderr)(subprocess.run([SPIRV_CROSS, '--revision'], capture_output=True, text=True)).split())]
         tsv += [f'{k[0]}\t{v[0]}\t{" ".join(v[1])}\t{v[3]}' for k, v in sorted(seen.items())]
