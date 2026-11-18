@@ -109,7 +109,7 @@ own_dead_stats own_alias_dead_locked(uint32_t now, uint32_t idle, own_use_fn use
 uint32_t own_pool_finalize_locked(const void *pool, CFSetRef also);
 void own_alias_at_locked(const void *pool, int64_t off, void (^fn)(const alias_key *k, id o));   // the entries that start at off in the pool (its cell of the index)
 void own_alias_each_locked(void (^fn)(const alias_key *k, id o));
-typedef struct { uint32_t n, cap, cells; uint64_t evicted, taken, pool_entries; } own_alias_stats;   // entries, capacity, index cells, evicted with pools / on takeover in total, serial entries that went with their pools
+typedef struct { uint32_t n, cap, cells; uint64_t evicted, taken, pool_entries, looks; } own_alias_stats;   // entries, capacity, index cells, evicted with pools / on takeover in total, serial entries that went with their pools, entries takeovers looked at
 own_alias_stats own_alias_stats_locked(void);
 typedef struct { uint32_t over_buffer, own; uint64_t own_bytes; } own_alias_unref;   // split: textures over a pool buffer (no memory of their own) / with memory of their own and its size
 uint32_t own_alias_unref_locked(own_alias_unref *split);      // entries no live or ghost entry resolves to (a walk: the memory report); split may be NULL
