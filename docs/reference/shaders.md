@@ -4,6 +4,14 @@ Finding, keying and translating shaders (`dm/gfx/tools/shader_split.py`, `dmsh_b
 
 ## Containers by engine
 
+### EA BIG4, EASF and NXSHADER archives
+
+- **Symptom:** the shader splitter cannot reach an EA title's shader programs inside its BIG4 archives. A reader that imports PyCryptodome only on encountering EASF instead fails late in a clean tool environment.
+- **Cause:** these archives wrap NXSHADER programs in chunkzip raw-deflate blocks and EASF AES-CBC encryption. Existing Frostbite readers use different layouts. EASF's eight-byte ID identifies an `id[8], key[16]` registry entry in the matching main NSO; the header verifies the first 32 plaintext bytes.
+- **Fix:** `easf` reads members by signature, validates ranges and decoded sizes, finds and verifies the registry key, and passes control/code records to normal package, fact and pairing generation. Archive jobs use their version's main, with the newest main for DLC, and the normal worker/unreadable-file path. CBC decryption shares `dm/tools/aes.py` with the existing Unreal and RPF6 ECB readers, so no extra Python crypto dependency is introduced.
+- **Check:** synthetic fixtures cover key discovery, bad candidates, compressed NSOs, archive bounds, compute offsets, version separation, DLC, directory/image IO and package export while PyCryptodome is unavailable. Independent AES known-answer vectors and existing encrypted Unreal/RPF6 fixtures check the shared helper. The current-main split of FIFA 23 reproduces all 386 expected shader keys and its full Mac shader build succeeds.
+- **Found on:** [FIFA 23 Legacy Edition](../../dm/games/01001C8016B4E000/README.md), [PR #1696](https://github.com/seedds/nxnative/pull/1696).
+
 ### Telltale effect packs in ttarch2 archives
 
 - **Symptom:** `[RED] the shader split found no shaders in main or the RomFS`, with `shaders: 0`, on a Telltale Tool game whose RomFS is `.ttarch2` archives and whose `main` names `*.t3fxpack`. No BNSH, BAHS or control-section magic appears in the compressed files.
@@ -176,7 +184,7 @@ Finding, keying and translating shaders (`dm/gfx/tools/shader_split.py`, `dmsh_b
 - **Fix:** an entry that lies inside a control section another entry names, measured by that section's own length (`ctl_len`, 0x48 key bytes for NVN2) rather than the length an entry claims, is dropped. Whether a false entry's section is genuine does not matter, as its first 0x48 bytes are a real control section.
 - **Found on:** [The Legend of Zelda: Ocarina of Time](../../dm/games/0400486024DEC000/README.md): six such shaders in `agl_common`, `agl_technique`, `agl_technique_pfx` and `tera_common`, none of them ever loaded; one failed the build. `tera_common` gave 175 variation pairs once its false entry was gone. [Splatoon Raiders](../../dm/games/0400380020056000/README.md): the same three agl keys (`68bbe98b3bfd9876`, `18be578dfdaaffa0`, `7a4936fccf82094e`), dropped when its tables were split again ([issue #1613](https://github.com/seedds/nxnative/issues/1613)). [Donkey Kong Bananza](../../dm/games/040074A01BF12000/README.md) was split again too and holds no such entry: its tables did not change. [Mario Kart World](../../dm/games/0400C3F00006E000/README.md): one compute shader in `agl_common` (`797e77c2ec4341c5`), dropped from its tables ([issue #1592](https://github.com/seedds/nxnative/issues/1592)).
 - **Payload outside the control section:** descriptor-shaped words can also lie after a control section, beyond the control-span exclusion. A nonempty binary record array that fits before the code region and agrees with the scan supplies the entry offsets for both shader selection and variation pairing. The split drops candidates outside those record entry slots. An unrecognized or inconsistent array leaves the scan candidates unchanged.
-- **Also found on:** [Mario Kart World 1.8.0](../../dm/games/0400C3F00006E000/README.md#180) and [Donkey Kong Bananza](../../dm/games/040074A01BF12000/README.md#found-on-this-game).
+- **Also found on:** [Mario Kart World 1.8.0](../../dm/games/0400C3F00006E000/README.md#180), [Donkey Kong Bananza](../../dm/games/040074A01BF12000/README.md#found-on-this-game) and [The Legend of Zelda: Ocarina of Time](../../dm/games/0400486024DEC000/README.md).
 - **Check:** `dm/tools/tests/test_split_bahs_entries.py` uses synthetic fixtures for control words, payload outside entry slots, and scan fallback for inconsistent arrays, including empty arrays and arrays overlapping code.
 
 ### Zstd files recognised by their magic
