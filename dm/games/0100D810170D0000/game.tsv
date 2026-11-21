@@ -1,0 +1,42 @@
+# Nine Sols 1.3, Unity 2022.3.33f1 IL2CPP, SDK 18.3.2, NVN.
+
+# ---- Identity ----
+title_id	0100D810170D0000
+program_id	0100D810170D0000
+
+# ---- App ----
+name	Nine Sols
+ipa	NineSols.ipa
+app_category	public.app-category.games
+
+# ---- Versions ----
+build	v196608	1.3	main=976ab66e91f587b8c719c39c7a67bbe8	subsdk0=ca1378cdd05a63438ef12ee7fbd5ca9c	sdk=f118ae1c2e7728471aaf1a0d58484968
+package	v196608
+shader_versions	v196608
+
+# ---- Files ----
+modules	main subsdk0 sdk
+romfs_marker	Data/StreamingAssets/aa/Switch/defaultlocalgroup_assets_all_0bed32e18ec07536761829304081c0ab.bundle
+zip_store	.assets:.bnk:.bundle:.dat:.resource:.ress:.wem:.metallib
+
+# ---- Memory ----
+# The NPDM declares 8 MB of system resource. Unity uses virtual address memory and main sets a heap.
+sys_resource	0x800000
+mem_reserve	0x140000000
+mem_alias	0x118000000
+mem_stack	0x10000000
+app_pool	0xCD500000
+# Keep room for Unity's own regions in the iPhone layout (4.375 GB alias region). StandardAllocator reserves
+# 3.14 GB (alias +0.06 .. +3.20) but maps well under 1 GB; Unity's own 16 MB chunks then ran out of address
+# space past +4.38 GB (null allocation, sig 11 addr 0 at main+0x795b30, about 160 s in on the iPhone, and on the
+# Mac with DM_ALIAS_SIZE=0x118000000). With the cap the same Mac run reached +3.76 GB and the iPhone +4.00 GB.
+# Same shape and fix as Persona 5 Tactica (010087701B092000).
+stdalloc_cap	0x60000000
+
+# ---- Graphics ----
+# The game calls nvnDeviceSetDepthMode with near = 0 in the heap check's boot.
+depth_mode	zero
+
+# ---- Shader split ----
+shader_groups	/Data/=data
+shader_note	Nine Sols shaders
