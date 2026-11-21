@@ -20,13 +20,13 @@
 #     whose blend factors read source 1
 # Super Mario Galaxy generates its GX shaders at run time; they come from a capture folder (the Mac host's DM_VK_CAPTURE), read like a RomFS: every input folder is
 # searched for SPIR-V files by their magic
-# Output: <out>/vk/vk_shaders.metallib and <out>/vk/vk_shaders.tsv; --ios <dir> also writes <dir>/vk/ with an iPhone library (same table)
+# Output: <out>/vk/vk_shaders.metallib (and vk_shaders.1.metallib ... when there are more than DM_VK_LIB_SHADERS shaders) and <out>/vk/vk_shaders.tsv; --ios <dir> also writes <dir>/vk/ with an iPhone library (same table)
 # Table rows: key <TAB> stage (vert / frag / comp:x,y,z / geomvp:location) <TAB> resources, space-separated kind:set.binding=slot[*count]; lower-case u/b/t/s/c/p bind discrete buffers, textures, samplers and push constants;
 #   upper-case U/B/T/S are argument-buffer members, with @id after the slot and count for the first element's Metal ID;
 #   o maps a dynamic buffer's set.binding to an offset index, and q gives that offset buffer's Metal slot
 # RenderDragon material bone-index inputs are repaired in SPIR-V before translation; keys still identify the game's original words.
 # Usage: vk_shaders.py <SPIR-V dir | NSO>... <out dir> [--ios <dir>]
-import concurrent.futures as cf, hashlib, json, os, re, struct, subprocess, sys, tempfile
+import concurrent.futures as cf, glob, hashlib, json, os, re, struct, subprocess, sys, tempfile
 from typing import NoReturn
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../../tools'))
 from romfs import os, open
@@ -569,11 +569,23 @@ def metallib(msls, out, sdk, extra):
         if r.returncode: red(f'{m}: metal compile failed: {r.stderr.strip()[:400]}')
         return a
     with cf.ThreadPoolExecutor(os.cpu_count()) as ex: airs = list(ex.map(comp, msls))
-    lib = os.path.join(out, 'vk_shaders.metallib')
+    # The link is one process holding every shader: 3,359 Godot shaders (Until Then) took 28 GB in air-lld on a 16 GB Mac and filled the disk with swap. So at most lib_size() shaders go into one
+    # library, one link after the other: vk_shaders.metallib, then vk_shaders.1.metallib, vk_shaders.2.metallib ... (the first keeps its name, which build_ipa.sh and the packer look for; the
+    # host loads every library in the folder and finds each function in its own, hle_vk.m lib_of). Libraries of an earlier run go first, so a smaller set leaves none behind
+    for old in glob.glob(os.path.join(out, 'vk_shaders*.metallib')): os.remove(old)
+    n = lib_size(); libs = []
     # relative to their common folder: thousands of absolute paths under a long work folder pass ARG_MAX (1 MB on macOS) and xcrun fails with E2BIG
-    base = os.path.commonpath([os.path.dirname(x) for x in airs])
-    subprocess.run(['xcrun', '-sdk', sdk, 'metallib', *[os.path.relpath(x, base) for x in airs], '-o', os.path.abspath(lib)], check=True, cwd=base)
-    return lib
+    base = os.path.commonpath([os.path.dirname(x) for x in airs]) if airs else out
+    for i in range(0, max(len(airs), 1), n):
+        lib = os.path.join(out, 'vk_shaders.metallib' if i == 0 else f'vk_shaders.{i // n}.metallib')
+        subprocess.run(['xcrun', '-sdk', sdk, 'metallib', *[os.path.relpath(x, base) for x in airs[i:i + n]], '-o', os.path.abspath(lib)], check=True, cwd=base)
+        libs.append(lib)
+    return libs
+
+def lib_size():
+    """How many shaders one library holds: DM_VK_LIB_SHADERS (default 500, a margin under the 864 shaders of Until Then's first capture, which linked in one library without trouble, as its larger shaders weigh twice as much; at least 1)"""
+    try: return max(1, int(os.environ.get('DM_VK_LIB_SHADERS', '500')))
+    except ValueError: return 500
 
 def main():
     a = sys.argv[1:]
@@ -601,9 +613,9 @@ def main():
         # no NaN / Inf, which would let it drop the NaN handling of the precise:: functions above
         if ios: dirs.append((os.path.join(ios, 'vk'), 'iphoneos', list(IOS_FLAGS)))
         for d, sdk, extra in dirs:
-            lib = metallib(msls, d, sdk, extra)
+            libs = metallib(msls, d, sdk, extra)
             open(os.path.join(d, 'vk_shaders.tsv'), 'w').write('\n'.join(tsv) + '\n')
-            print(f'{sdk}: {len(seen)} shaders → {lib}')
+            print(f'{sdk}: {len(seen)} shaders → {libs[0]}' + (f' and {len(libs) - 1} more librar{"y" if len(libs) == 2 else "ies"} (vk_shaders.1.metallib ...)' if len(libs) > 1 else ''))
 
 if __name__ == '__main__':
     try: main()

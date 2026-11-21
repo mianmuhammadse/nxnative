@@ -225,7 +225,11 @@ typedef struct { char key[17]; int frag, comp, nres, geom_vp; uint16_t wg[3]; sh
 enum { ST_VERT, ST_FRAG, ST_COMP };
 static int is_arg(char k) { return k && strchr("UBTS", k); }
 static shinfo *g_sh; static int g_nsh;
-static id<MTLLibrary> g_lib;
+static id<MTLLibrary> g_lib;   // the first shader library (vk_shaders.metallib); the tests set only this one
+// A large game's shaders are linked in several libraries (vk_shaders.metallib, vk_shaders.1.metallib, ...: dm/gfx/tools/vk_shaders.py, DM_VK_LIB_SHADERS), because one link of thousands of
+// shaders took 28 GB of memory (Until Then, 3,359 Godot shaders). g_fnlib maps each function name to the library that holds it; lib_of is the library a function is made from (and specialized in)
+static NSMutableDictionary<NSString *, id<MTLLibrary>> *g_fnlib; static int g_nlibs;
+static id<MTLLibrary> lib_of(NSString *name) { id<MTLLibrary> l = g_fnlib[name]; return l ? l : g_lib; }
 static int sh_cmp(const void *a, const void *b) { return memcmp(((const shinfo *)a)->key, ((const shinfo *)b)->key, 16); }
 static int sh_number(const char **p, unsigned *out) {
     if (**p < '0' || **p > '9') return 0;
@@ -300,7 +304,18 @@ static void sh_load(void) {
     snprintf(p, sizeof p, "%s/vk/vk_shaders.metallib", d);
     NSError *err = nil;
     g_lib = [g_dev newLibraryWithURL:[NSURL fileURLWithPath:@(p)] error:&err];
-    if (!g_lib) LOG("[vk] [RED] shader library failed to load %s: %s", p, err.localizedDescription.UTF8String);
+    if (!g_lib) { LOG("[vk] [RED] shader library failed to load %s: %s", p, err.localizedDescription.UTF8String); return; }
+    g_nlibs = 1; g_fnlib = [NSMutableDictionary new];
+    for (NSString *n in g_lib.functionNames) g_fnlib[n] = g_lib;
+    for (int i = 1; i < 256; i++) {   // the further libraries, numbered from 1 without a gap (vk_shaders.py writes them so)
+        snprintf(p, sizeof p, "%s/vk/vk_shaders.%d.metallib", d, i);
+        if (access(p, F_OK)) break;
+        id<MTLLibrary> l = [g_dev newLibraryWithURL:[NSURL fileURLWithPath:@(p)] error:&err];
+        if (!l) { LOG("[vk] [RED] shader library failed to load %s: %s", p, err.localizedDescription.UTF8String); continue; }
+        for (NSString *n in l.functionNames) g_fnlib[n] = l;
+        g_nlibs++;
+    }
+    if (g_nlibs > 1) LOG("[vk] %d shader libraries, %lu functions", g_nlibs, (unsigned long)g_fnlib.count);
 }
 static const shinfo *sh_find(const char *key) { shinfo k; memcpy(k.key, key, 16); return g_nsh ? bsearch(&k, g_sh, g_nsh, sizeof *g_sh, sh_cmp) : NULL; }
 
@@ -1161,7 +1176,7 @@ VKB(vkCreateShaderModule, VkResult, VkDevice d, const VkShaderModuleCreateInfo *
     m->si = sh_find(m->key);
     @autoreleasepool {
         if (m->si && !m->si->geom_vp && g_lib) {
-            m->fn = [g_lib newFunctionWithName:[NSString stringWithFormat:@"vk_%s", m->key]];
+            { NSString *fnm = [NSString stringWithFormat:@"vk_%s", m->key]; m->fn = [lib_of(fnm) newFunctionWithName:fnm]; }
         }
     }
     if (!m->fn && !(m->si && m->si->geom_vp)) LOG("[vk] [RED] shader %s (%zu bytes of SPIR-V) is not in the library", m->key, ci->codeSize);
@@ -1219,7 +1234,7 @@ static id<MTLFunction> spec_fn(id<MTLFunction> fn, const VkSpecializationInfo *s
             else RED1("specialization constant of Metal type %lu not handled", (unsigned long)c.type);
         }
     NSError *err = nil;
-    id<MTLFunction> f = [g_lib newFunctionWithName:fn.name constantValues:cv error:&err];
+    id<MTLFunction> f = [lib_of(fn.name) newFunctionWithName:fn.name constantValues:cv error:&err];
     if (!f) LOG("[vk] [RED] shader %s with its specialization constants: %s", fn.name.UTF8String, err.localizedDescription.UTF8String);
     return f;
 }
@@ -1246,7 +1261,7 @@ static VkPipeline pipe_make(const VkGraphicsPipelineCreateInfo *ci) {
                 id<MTLFunction> fn = m->fn;
                 if (geom_vp) {
                     fn = fn && topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST && max_viewports() > 1
-                        ? [g_lib newFunctionWithName:[NSString stringWithFormat:@"vk_%s_vp%d", m->key, geom_vp - 1]] : nil;
+                        ? ({ NSString *fnm = [NSString stringWithFormat:@"vk_%s_vp%d", m->key, geom_vp - 1]; [lib_of(fnm) newFunctionWithName:fnm]; }) : nil;
                     if (!fn) LOG("[vk] [RED] geometry viewport lowering unavailable for vertex shader %s at location %d (topology %d)", m->key, geom_vp - 1, topology);
                 }
                 pd.vertexFunction = spec_fn(fn, st->pSpecializationInfo); p->vs = m->si;
@@ -1254,7 +1269,7 @@ static VkPipeline pipe_make(const VkGraphicsPipelineCreateInfo *ci) {
             else if (st->stage == VK_SHADER_STAGE_FRAGMENT_BIT) {
                 if (dual && m->fn) {   // pipelines may be built on several threads
                     static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER; pthread_mutex_lock(&mu);
-                    if (!m->tried_d) { m->tried_d = 1; m->fn_d = [g_lib newFunctionWithName:[NSString stringWithFormat:@"vk_%s_d", m->key]]; }
+                    if (!m->tried_d) { m->tried_d = 1; NSString *fnm = [NSString stringWithFormat:@"vk_%s_d", m->key]; m->fn_d = [lib_of(fnm) newFunctionWithName:fnm]; }
                     pthread_mutex_unlock(&mu);
                 }
                 pd.fragmentFunction = spec_fn(dual && m->fn_d ? m->fn_d : m->fn, st->pSpecializationInfo); p->fs = m->si;

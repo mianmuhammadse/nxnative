@@ -2758,6 +2758,21 @@ Finding, keying and translating shaders (`dm/gfx/tools/shader_split.py`, `dmsh_b
 - **Fix:** `gl_shaders.py` gained `uni_members()`, which walks a struct type's members and emits one row per member with the dotted name (`u:u_LightEnv.m_dirLights_dir[0]`), adding each member's offset to its parent's (the reflection gives a nested member's offset relative to its parent); arrays of structs return an error.
 - **Found on:** [Well Dweller](../../dm/games/0100217023F6C000/README.md), whose lighting programs were the missing ones.
 
+### One library for thousands of Vulkan shaders exhausts memory at the link
+
+- **Symptom:** the Vulkan shader step (`vk_shaders.py`) runs for 20 minutes or more on a game with thousands of shaders; `air-lld` (the Metal linker `xcrun metallib` starts) holds 28 GB on a 16 GB Mac, the swap grows by gigabytes a minute and the disk fills.
+- **Cause:** every shader was compiled to its own AIR file in parallel, then linked in one process into one `vk_shaders.metallib`. The link's memory grows with the number and size of the shaders: 864 shaders linked without trouble, 3,359 Godot shaders (the renderer's variants, about 49 KB of SPIR-V each for the forward renderer) did not.
+- **Fix:** `metallib()` in `dm/gfx/tools/vk_shaders.py` links at most `DM_VK_LIB_SHADERS` shaders (default 500) into one library, one link after the other: `vk_shaders.metallib`, then `vk_shaders.1.metallib`, `vk_shaders.2.metallib` ... The first keeps its name (`build_ipa.sh` and the packer look for it); libraries of an earlier run are deleted first. `sh_load` in `dm/gfx/vk/hle_vk.m` loads every library of the folder and `lib_of` makes each function (and its specialization) from the library that holds it. The app packaging copies the whole `vk` folder, so nothing else changes. A small set stays one library.
+- **Found on:** a Godot game on Vulkan, SDK 19 (3,359 shaders).
+- **Check:** `python3 dm/tools/tests/test_vk_shaders.py` (`LibraryChunks`: the size setting, the split, a small set in one library, no library of an earlier run left) and `dm/gfx/tests/t_vk_libs.m` (five libraries loaded through `DM_MSL_DIR`, each function found in its own, a gap in the numbering ends the search).
+
+### Godot's shader cache holds the SPIR-V of every variant
+
+- **Symptom:** a Godot game on Vulkan has no SPIR-V file in its RomFS, so the shaders are captured by playing (`DM_VK_CAPTURE`). A scene nobody played has shaders the library lacks: `[RED] shader <key> (N bytes of SPIR-V) is not in the library`, then `draws skipped`, and one effect is missing from that scene on every run.
+- **Cause:** Godot makes a shader the first time a scene needs it, so a capture holds only what was played (395 shaders at the title, 864 after hours of play).
+- **Fix (done by hand so far, not in the packer):** the RomFS holds Godot's own cache, `shader_cache/<family>/<hash>/<hash>.vulkan.cache` (`GDSC`, version 3; per variant a `GSBD` record with one zstd block per stage). Each block decompresses to SMOL-V (the bytes `LOMS`, the magic `SMOL` little-endian; the public-domain decoder is github.com/aras-p/smol-v), which decodes to the SPIR-V. The key the host uses, the first 8 bytes of the module's SHA-256, matched: all 864 captured shaders and the 10 a phone run missed were in the cache's 3,359 modules (2,279 forward renderer, 926 canvas, 154 others). Writing each module to `vk_capture/<key>.spv` and listing the keys in the profile's `vk_capture.tsv` gives every variant without playing. The packer does not read the cache yet (open); the size of that set is why the library is linked in several parts (the entry above).
+- **Found on:** a Godot game on Vulkan, SDK 19 (an iPhone 15 run missed 10 shaders after 8,300 frames).
+
 ## Pipelines and caches
 
 ### A compile that does not return stalls every flush and draw

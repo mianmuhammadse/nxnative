@@ -445,5 +445,41 @@ class ShaderTable(unittest.TestCase):
         self.assertNotIn('--msl', run.call_args_list[2].args[0])
 
 
+class LibraryChunks(unittest.TestCase):
+    """A large game's shaders are linked in several libraries (one link of 3,359 Godot shaders took 28 GB): vk_shaders.metallib, vk_shaders.1.metallib ..."""
+    def msls(self, td, n):
+        out = []
+        for i in range(n):
+            f = Path(td) / f'k{i}.metal'
+            f.write_text(f'#include <metal_stdlib>\nusing namespace metal;\nvertex float4 vk_k{i}(uint v [[vertex_id]]) {{ return float4(float(v + {i})); }}\n')
+            out.append(str(f))
+        return out
+
+    def build(self, n, per, stale=()):
+        with tempfile.TemporaryDirectory() as td, tempfile.TemporaryDirectory() as out:
+            for name in stale: (Path(out) / name).write_bytes(b'old')
+            with patch.dict('os.environ', {'DM_VK_LIB_SHADERS': per}):
+                libs = vs.metallib(self.msls(td, n), out, 'macosx', [vs.MAC_MIN_FLAG])
+            return [Path(x).name for x in libs], sorted(p.name for p in Path(out).glob('*.metallib')), [Path(x).stat().st_size if Path(x).exists() else 0 for x in libs]
+
+    def test_the_size_is_a_setting(self):
+        for value, want in (('700', 700), ('2', 2), ('0', 1), ('x', 500)):
+            with patch.dict('os.environ', {'DM_VK_LIB_SHADERS': value}): self.assertEqual(vs.lib_size(), want, value)
+
+    def test_five_shaders_two_to_a_library(self):
+        libs, files, sizes = self.build(5, '2')
+        self.assertEqual(libs, ['vk_shaders.metallib', 'vk_shaders.1.metallib', 'vk_shaders.2.metallib'])
+        self.assertEqual(files, sorted(libs))
+
+    def test_a_small_set_stays_one_library_under_the_old_name(self):
+        libs, files, sizes = self.build(3, '500')
+        self.assertEqual(libs, ['vk_shaders.metallib']); self.assertEqual(files, libs)
+
+    def test_libraries_of_an_earlier_run_do_not_stay(self):   # the host loads every vk_shaders.N.metallib it finds
+        libs, files, sizes = self.build(2, '500', stale=('vk_shaders.metallib', 'vk_shaders.1.metallib', 'vk_shaders.7.metallib'))
+        self.assertEqual(files, ['vk_shaders.metallib'])
+        self.assertGreater(sizes[0], 3)   # the new library, not the old bytes
+
+
 if __name__ == '__main__':
     unittest.main()
