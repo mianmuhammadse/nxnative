@@ -355,7 +355,7 @@
 - **Symptom:** a `--romfs separate` app whose image was copied into its Documents folder by hand (Finder, the Files app, a LiveContainer guest) logs `boot: game files not found (Documents/romfs.img, Documents/romfs or <App>/romfs)`, and a build with `romfs.id` shows "There is no game file image on this device.", though the complete image is there. Renaming it to `romfs.img` makes the game start.
 - **Cause:** the NSP script writes the image as `extract/<version>/RomFS.img`, and `push_romfs.sh` copies it to `Documents/romfs.img`. A hand copy keeps the source's name. The Mac's file system ignores letter case, so the mismatch never shows there, but iOS's does not, and `main.m` looked up only the exact `romfs.img`.
 - **Fix:** `main.m` (`romfs_document_images`) lists Documents for `romfs.img` in any letter case, `romfs.img` itself first, and takes the first that is complete and passes the `romfs.id` check; a rejected or incomplete one falls through to the next spelling, then to the folders. The identity report, the backup exclusion and the log lines use the names found. Folder names (`Documents/romfs`) are still matched exactly.
-- **Found on:** South Park: The Fractured But Whole 1.05 (`01008F2005154000`, no profile here) on an iPhone 15 Pro Max, [issue #582](https://github.com/seedds/nxnative/issues/582). The Foundation startup test runs the locator on a case-sensitive APFS disk image.
+- **Found on:** [South Park: The Fractured But Whole](../../dm/games/01008F2005154000/README.md) 1.05 on an iPhone 15 Pro Max. The Foundation startup test runs the locator on a case-sensitive APFS disk image. [Issue #582](https://github.com/seedds/nxnative/issues/582).
 
 ### Building creates a full RomFS tree before packing its image
 
@@ -487,6 +487,14 @@
 - **Check:** `test_romfs_read.py` verifies distinct virtual file descriptors, cleanup after an exception and correct reads after an image is replaced.
 
 ## Add-on content
+
+### Separate DLC for a NUP
+
+- **Symptom:** a build from a NUP with no embedded DLC omits add-ons the player has as separate RomFS images. The host logs `aoc: reporting 0 add-on contents {} (no DM_AOC_DIR)`.
+- **Cause:** the packing script selected DLC solely from the container. A separately extracted image never reached the shader scan or the app packer.
+- **Fix:** `--aoc-dir <folder>` selects a directory of numbered RomFS images for a NUP with no embedded DLC. The script validates the images and stages the complete set separately from the package extraction cache. Each rebuild uses the current selection, including after a front end clears its build folder. An empty folder selects no DLC. A NUP that already lists DLC rejects the option. A prepared Xcode project compares these images by checksum on incremental builds because a replacement can have the same size and whole-second modification time.
+- **Found on:** [Pokémon Pokopia](../../dm/games/0400A3A01EE4C000/README.md), v655360, whose marker add-on unlocks data in the update. [PR #2905](https://github.com/seedds/nxnative/pull/2905) reports the result on a MacBook Air.
+- **Check:** `test_nsp_nup.py` checks that the selected images reach the build, stale package images stay out, and rebuilds handle replacement, removal and cleanup. `test_xcode_workflow.py` checks that the staged app also replaces images with matching sizes and times and removes retired images.
 
 ### DLC in Documents is ignored or removed DLC remains installed
 
@@ -774,3 +782,11 @@
 - **Cause:** the base game's HtmlDocument NCA can be sparse too (16 KB, beside the sparse Program NCA). `--html` reads the update's HtmlDocument NCAs, each over a base one when it is a patch, and then every base HtmlDocument NCA on its own; a sparse one read alone fails the hash check while its tables open.
 - **Fix:** `dm/tools/nx_extract/Program.cs` reads no sparse base HtmlDocument NCA on its own (`a sparse HtmlDocument NCA of the base game (… bytes): read only through the update's patch, not alone`), as Horizon mounts it only through its patch.
 - **Found on:** [Minecraft Dungeons II](../../dm/games/0100A7C01B792000/README.md), base v0 with update v131072: the update's patch (`accessible-urls`) and its full legal information NCA are read, the base's legal information NCA too.
+
+### Unreal 4.27 shaders with 8-byte hashes, an untagged record or a version 12 pak
+
+- **Symptom:** the shader split for an Unreal 4.27 game finds no shaders or stops on the shader library: `shader library chunk … does not parse`, `pak version 12, only … are read`, or `not an LSLG record`.
+- **Cause:** Godzilla: Destroy All Monsters Melee Remastered uses 8-byte xxHash64 values in its IoStore shader library. The reader supported 20-byte SHA-1 values, as used by FINAL FANTASY RESONANCE. Godzilla's Switch shader records omit the `LSLG` and stage tag, and its pak footer is version 12.
+- **Fix:** `uepak.py` tries 20-byte hashes first and switches to 8 only if the tables fail to parse with matching counts and consume the whole chunk. The version 2 archive stores each 8-byte hash with 12 zero bytes appended. Version 12 follows version 11's footer rules. For untagged Switch records, `raw_record` looks for a unique control section with matching code lengths and a `0x880`-byte control length. `shader_split.ue_shaders` takes the stage from the archive's frequency for those records.
+- **Check:** `test_uepak_iostore.py` covers both hash widths, a wrong-width parse that reaches the chunk's end, valid and legacy-position version 12 footers, and untagged records with code or control length mismatches or a copy of the control magic inside shader code. The [PR author](https://github.com/seedds/nxnative/pull/3022) built 6,878 Mac shaders for update 131072.
+- **Found on:** Godzilla: Destroy All Monsters Melee Remastered (`0100A00026D70000`).
