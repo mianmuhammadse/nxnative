@@ -3329,6 +3329,9 @@ static int bc_astc(const tex_t *t, uint32_t *pf) {
     }
     *pf = apf; return 1;
 }
+// The no-BC decision and the ASTC mode, for the Vulkan layer (hle_vk.m), which stores BC images the same way (one decision for both APIs: DM_TEST_NO_BC, DM_NO_BC_ASTC)
+int mtl_no_bc(void) { return no_bc(); }
+int mtl_no_bc_astc_mode(void) { return astc_mode(); }
 static int nvn_fmt_bc(uint32_t f) { return f >= 0x41 && f <= 0x50; }   // NVN BC1–7 / BC6H formats (0x41 RGB_DXT1 … 0x50 BC6H unsigned)
 static int mtl_fmt_block_bc(MTLPixelFormat f) { return f >= MTLPixelFormatBC1_RGBA && f <= MTLPixelFormatBC7_RGBAUnorm_sRGB; }   // a real BC format (not the decompressed or ASTC stand-in)
 static void tex_tag_format(id<MTLTexture> mt, uint32_t nvn_fmt);   // memory by texture format, below

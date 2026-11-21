@@ -12,6 +12,9 @@ void mtl_set_origin_lower_left(int on);   // NVN window origin: 1 = lower left (
 void mtl_set_queue_origin_lower_left(int on); // Raster flip captured at NVN queue creation; selected under the submit lock.
 void bf_want_note(const char *key);
 
+// A GPU without BC textures (A15 / A16 ...): 1 when BC images must be stored as ASTC 4x4 (BC1-3) or decompressed (every other BC format), as the NVN layer does. DM_TEST_NO_BC=1 forces it
+int mtl_no_bc(void);
+int mtl_no_bc_astc_mode(void);   // DM_NO_BC_ASTC: 2 BC1-3 as ASTC (default), 1 BC1 only, 0 everything decompressed
 // Memory pool: [mem, mem+size) is expanded outward to page boundaries to build a zero-copy buffer; look up the buffer and offset by GPU address (= CPU address)
 void mtl_pool_add(const void *mem, uint64_t size);
 void mtl_pool_addressed(const void *mem, uint64_t size);   // the game holds a GPU address in this range, so raw global memory may reach it
