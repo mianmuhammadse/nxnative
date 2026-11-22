@@ -1,0 +1,37 @@
+# Until Then 1.0.7, Godot (Vulkan renderer), SDK 19.3.9, Vulkan.
+
+# ---- Identity ----
+title_id	010019C023004000
+program_id	010019C023004000
+
+# ---- App ----
+name	Until Then
+ipa	UntilThen.ipa
+app_category	public.app-category.games
+
+# ---- Versions ----
+build	v458752	1.0.7	main=b4f859ba44751f262ea66c4d5c5784a2	sdk=d83a56a5558798414c78ec722867a7da
+package	v458752
+shader_versions	v458752
+
+# ---- Files ----
+# not loaded, main takes nothing from them the host does not supply: subsdk0 (NintendoSDK_OpenGL), subsdk1 (NintendoSDK_Vulkan)
+modules	main sdk
+romfs_marker	vulkan_pipelines.mobile.cache
+zip_store	.bank:.bin:.ctexarray:.fontdata:.foz:.mp3str:.nro:.ogv:.png:.metallib
+
+# ---- Memory ----
+# main sets a heap of at most the pool − 64 MB: a 3328 MB heap region
+mem_reserve	0x100000000
+mem_alias	0x10000000
+mem_stack	0x10000000
+app_pool	0xCD500000
+# the NPDM declares 0 MB of system resource: IsVirtualAddressMemoryEnabled is false, as on Horizon (Big Brain Academy: Brain vs. Brain sets a heap only then)
+sys_resource	0x0
+
+# ---- Shader split ----
+shader_groups	/.godot/=godot /scenes/=scenes /assets/=assets /addons/=addons /ui/=ui /shader_cache/=shadercache /components/=components /modules/=modules /data/=data /fonts/=fonts /.nro/=nro /.nrr/=nrr
+shader_note	Until Then shaders
+
+# the game makes a 1280x720 layer; docked, the Vulkan surface was 1920x1080 and the picture filled only the top-left. Handheld: 720p and touch
+op_mode	handheld
