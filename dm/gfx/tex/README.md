@@ -31,7 +31,7 @@ Some older Apple GPUs do not support BC compressed textures (determined by `supp
 - a BC texture is never a render target and its raw blocks are not sampled through an uncompressed view, with or without BC (Metal has no such views; Breath of the Wild encodes one 32×32 BC4 texture on the GPU, GitHub issue #4). The CPU and `copy_t2b` readbacks of a GPU-written BC texture are not done (red lines 51 and 52);
 - a BC texture is never a render target and its raw blocks are not sampled through an uncompressed view, with or without BC (Metal has no such views; Breath of the Wild encodes one 32×32 BC4 texture on the GPU, GitHub issue #4).
 
-The environment variable `DM_TEST_NO_BC=1` forces this path on any machine.
+The environment variable `DM_TEST_NO_BC=1` forces this path on any machine. The Vulkan layer (`dm/gfx/vk/hle_vk.m`, `bc_store`) uses the same decision (`mtl_no_bc`, `mtl_no_bc_astc_mode`) and the same CPU routines (`nvn_bc2astc`, `nvn_bc_decode`) for its BC images; `dm/gfx/tests/t_vk_bc.m` checks it.
 
 ## Tests
 

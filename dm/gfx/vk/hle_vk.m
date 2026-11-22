@@ -19,6 +19,8 @@
 #include "../../host/hle.h"
 #include "../nvn/nvn_mtl.h"
 #include "../nvn/nvn_dbnd.h"
+#include "../tex/nvn_bc2astc.h"   // no BC: BC1-3 stored as ASTC 4x4 (bc_store)
+#include "../tex/nvn_bcdec.h"     // no BC: the other BC formats decompressed on the CPU
 #import "../nvn/host_msl.h"
 #include <vulkan/vulkan_core.h>
 #include <vulkan/vulkan_vi.h>
@@ -123,6 +125,34 @@ static const fmt_t *fmt_of(VkFormat f) {
 }
 static int fmt_has_depth(const fmt_t *f) { return f && (f->kind == K_DEPTH || f->kind == K_DS); }
 static int fmt_has_stencil(const fmt_t *f) { return f && (f->kind == K_STENCIL || f->kind == K_DS); }
+
+// ---------- BC images on a GPU without BC (A15 / A16 ...) ----------
+// Metal aborts the process on a BC pixel format there (MTLTextureDescriptor validation), and a Vulkan game made for the Switch (whose GPU reads BC) asks for them first thing (Until Then,
+// Godot: BC3 at its first texture). As in the NVN layer (nvn_mtl.m, bc_astc / bc_unpack): BC1-3 are stored as ASTC 4x4 (8 bits per texel) by transcoding every block on the CPU at upload, and
+// BC4-7 are decompressed (R8 / RG8 / RGBA8 / RGBA16F); 3D and multisampled images stay decompressed. The helpers are the NVN layer's, which name formats by NVN's numbers
+static int bc_nvn(VkFormat f) {   // the NVN format number of a Vulkan BC format, 0 for any other
+    switch (f) {
+    case VK_FORMAT_BC1_RGB_UNORM_BLOCK: return 0x41;   case VK_FORMAT_BC1_RGBA_UNORM_BLOCK: return 0x42;
+    case VK_FORMAT_BC2_UNORM_BLOCK: return 0x43;       case VK_FORMAT_BC3_UNORM_BLOCK: return 0x44;
+    case VK_FORMAT_BC1_RGB_SRGB_BLOCK: return 0x45;    case VK_FORMAT_BC1_RGBA_SRGB_BLOCK: return 0x46;
+    case VK_FORMAT_BC2_SRGB_BLOCK: return 0x47;        case VK_FORMAT_BC3_SRGB_BLOCK: return 0x48;
+    case VK_FORMAT_BC4_UNORM_BLOCK: return 0x49;       case VK_FORMAT_BC4_SNORM_BLOCK: return 0x4a;
+    case VK_FORMAT_BC5_UNORM_BLOCK: return 0x4b;       case VK_FORMAT_BC5_SNORM_BLOCK: return 0x4c;
+    case VK_FORMAT_BC7_UNORM_BLOCK: return 0x4d;       case VK_FORMAT_BC7_SRGB_BLOCK: return 0x4e;
+    case VK_FORMAT_BC6H_SFLOAT_BLOCK: return 0x4f;     case VK_FORMAT_BC6H_UFLOAT_BLOCK: return 0x50;
+    default: return 0;
+    }
+}
+enum { BC_NONE, BC_ASTC, BC_UNPACK };
+// How a BC format is stored: BC_NONE (a real BC texture: the GPU has BC, or the format is not BC), BC_ASTC (*pf = ASTC 4x4) or BC_UNPACK (*pf = the decompressed format, *bpp bytes per texel)
+static int bc_store(VkFormat vf, VkImageType type, uint32_t samples, MTLPixelFormat *pf, int *bpp) {
+    int nf = bc_nvn(vf); if (!nf || !mtl_no_bc()) return BC_NONE;
+    uint32_t apf; int kind, mode = mtl_no_bc_astc_mode();
+    if (mode && nvn_bc_astc_fmt((uint32_t)nf, &apf, &kind) && (mode == 2 || kind == 1) && type != VK_IMAGE_TYPE_3D && samples <= 1) { *pf = (MTLPixelFormat)apf; *bpp = 0; return BC_ASTC; }
+    uint32_t upf; int ub;
+    if (nvn_bc_unpacked((uint32_t)nf, &upf, &ub)) { *pf = (MTLPixelFormat)upf; *bpp = ub; return BC_UNPACK; }
+    return BC_NONE;
+}
 static int fmt_is_signed_int(const fmt_t *f) {
     if (!f || f->kind != K_INT) return 0;
     switch (f->vk) {
@@ -195,7 +225,11 @@ typedef struct { char key[17]; int frag, comp, nres, geom_vp; uint16_t wg[3]; sh
 enum { ST_VERT, ST_FRAG, ST_COMP };
 static int is_arg(char k) { return k && strchr("UBTS", k); }
 static shinfo *g_sh; static int g_nsh;
-static id<MTLLibrary> g_lib;
+static id<MTLLibrary> g_lib;   // the first shader library (vk_shaders.metallib); the tests set only this one
+// A large game's shaders are linked in several libraries (vk_shaders.metallib, vk_shaders.1.metallib, ...: dm/gfx/tools/vk_shaders.py, DM_VK_LIB_SHADERS), because one link of thousands of
+// shaders took 28 GB of memory (Until Then, 3,359 Godot shaders). g_fnlib maps each function name to the library that holds it; lib_of is the library a function is made from (and specialized in)
+static NSMutableDictionary<NSString *, id<MTLLibrary>> *g_fnlib; static int g_nlibs;
+static id<MTLLibrary> lib_of(NSString *name) { id<MTLLibrary> l = g_fnlib[name]; return l ? l : g_lib; }
 static int sh_cmp(const void *a, const void *b) { return memcmp(((const shinfo *)a)->key, ((const shinfo *)b)->key, 16); }
 static int sh_number(const char **p, unsigned *out) {
     if (**p < '0' || **p > '9') return 0;
@@ -270,7 +304,18 @@ static void sh_load(void) {
     snprintf(p, sizeof p, "%s/vk/vk_shaders.metallib", d);
     NSError *err = nil;
     g_lib = [g_dev newLibraryWithURL:[NSURL fileURLWithPath:@(p)] error:&err];
-    if (!g_lib) LOG("[vk] [RED] shader library failed to load %s: %s", p, err.localizedDescription.UTF8String);
+    if (!g_lib) { LOG("[vk] [RED] shader library failed to load %s: %s", p, err.localizedDescription.UTF8String); return; }
+    g_nlibs = 1; g_fnlib = [NSMutableDictionary new];
+    for (NSString *n in g_lib.functionNames) g_fnlib[n] = g_lib;
+    for (int i = 1; i < 256; i++) {   // the further libraries, numbered from 1 without a gap (vk_shaders.py writes them so)
+        snprintf(p, sizeof p, "%s/vk/vk_shaders.%d.metallib", d, i);
+        if (access(p, F_OK)) break;
+        id<MTLLibrary> l = [g_dev newLibraryWithURL:[NSURL fileURLWithPath:@(p)] error:&err];
+        if (!l) { LOG("[vk] [RED] shader library failed to load %s: %s", p, err.localizedDescription.UTF8String); continue; }
+        for (NSString *n in l.functionNames) g_fnlib[n] = l;
+        g_nlibs++;
+    }
+    if (g_nlibs > 1) LOG("[vk] %d shader libraries, %lu functions", g_nlibs, (unsigned long)g_fnlib.count);
 }
 static const shinfo *sh_find(const char *key) { shinfo k; memcpy(k.key, key, 16); return g_nsh ? bsearch(&k, g_sh, g_nsh, sizeof *g_sh, sh_cmp) : NULL; }
 
@@ -309,6 +354,7 @@ struct VkBufferView_T { VkBuffer buf; const fmt_t *f; VkDeviceSize off, range; _
 struct VkImage_T { __strong id<MTLTexture> tex; const fmt_t *f; VkFormat fmt; VkImageType type; uint32_t w, h, d, mips, layers, samples; VkDeviceSize size; uint64_t serial;
                   VkImageUsageFlags usage; uint32_t pitch;   // pitch: row pitch of a linear image (its texture is made over the bound memory), 0 otherwise
                   VkDeviceMemory cmem; VkDeviceSize coff; uint8_t *shadow;   // a linear image of a converted format (fmt_t.conv): its memory, and the texels last unpacked
+                  uint8_t bcm, bpp, nvnf;   // a BC format on a GPU without BC (bc_store): BC_ASTC or BC_UNPACK, the decompressed texel size, the NVN format number
                   int swap; };   // one of a swap chain's images: the swap chain owns it
 struct VkImageView_T { __strong id<MTLTexture> tex; VkImage img; };
 struct VkSampler_T { __strong id<MTLSamplerState> s; __strong VkSamplerMetal *ref; };
@@ -774,7 +820,8 @@ VKB(vkCreateImage, VkResult, VkDevice d, const VkImageCreateInfo *ci, const VkAl
         uint32_t layers = umax(1, ci->arrayLayers), samples = umax(1, ci->samples);
         int cube = (ci->flags & VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT) && layers % 6 == 0;
         MTLTextureDescriptor *td = [MTLTextureDescriptor new];
-        td.pixelFormat = f->pf; td.width = ci->extent.width; td.height = umax(1, ci->extent.height); td.depth = umax(1, ci->extent.depth);
+        MTLPixelFormat spf = f->pf; int sbpp = 0, bcm = bc_store(ci->format, ci->imageType, samples, &spf, &sbpp);   // no BC: the stand-in format (bc_store)
+        td.pixelFormat = spf; td.width = ci->extent.width; td.height = umax(1, ci->extent.height); td.depth = umax(1, ci->extent.depth);
         td.mipmapLevelCount = umax(1, ci->mipLevels); td.sampleCount = samples;
         // A 1D image is a one-row 2D (array) texture, as in the NVN layer and in MoltenVK: Metal's 1D texture is no render target, has one level and no depth format, all of which
         // Vulkan's 1D image allows (Hades draws into a 512x1 colour target), and vk_shaders.py translates 1D images as texture2d (spirv-cross --msl-texture-1d-as-2d)
@@ -784,7 +831,7 @@ VKB(vkCreateImage, VkResult, VkDevice d, const VkImageCreateInfo *ci, const VkAl
         else td.textureType = layers > 1 ? MTLTextureType2DArray : MTLTextureType2D;
         td.arrayLength = cube ? layers / 6 : layers;
         MTLTextureUsage u = MTLTextureUsageShaderRead;
-        if (ci->usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT)) u |= MTLTextureUsageRenderTarget;   // a transfer destination may be cleared (C_CLEARI: a clearing pass)
+        if (!bcm && (ci->usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT))) u |= MTLTextureUsageRenderTarget;   // a transfer destination may be cleared (C_CLEARI: a clearing pass)
         if (samples > 1 && (ci->usage & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) && f->kind == K_COLOR) u |= MTLTextureUsageRenderTarget;
         if (ci->usage & VK_IMAGE_USAGE_STORAGE_BIT) u |= MTLTextureUsageShaderWrite;
         // A stencil-aspect view of a depth-stencil image is an X32_Stencil8 view, which Metal allows only with the format-view usage (Vulkan needs no mutable-format flag for it;
@@ -795,7 +842,8 @@ VKB(vkCreateImage, VkResult, VkDevice d, const VkImageCreateInfo *ci, const VkAl
         if (!t) { LOG("[vk] [RED] cannot create image %ux%ux%u format %d levels %u layers %u", ci->extent.width, ci->extent.height, ci->extent.depth, ci->format, ci->mipLevels, layers); return VK_ERROR_OUT_OF_DEVICE_MEMORY; }
         VkImage im = zalloc(sizeof *im);
         im->tex = t; im->f = f; im->fmt = ci->format; im->type = ci->imageType; im->w = (uint32_t)td.width; im->h = (uint32_t)td.height; im->d = (uint32_t)td.depth;
-        im->usage = ci->usage;
+        im->usage = ci->usage; im->bcm = (uint8_t)bcm; im->bpp = (uint8_t)sbpp; im->nvnf = (uint8_t)bc_nvn(ci->format);
+        if (bcm) { static int once; if (!once++) LOG("[vk] no BC: BC images are stored as ASTC 4x4 (BC1-3) or decompressed (the other formats), first one: format %d %ux%u → pixel format %lu", ci->format, im->w, im->h, (unsigned long)spf); }
         im->mips = (uint32_t)td.mipmapLevelCount; im->layers = layers; im->samples = samples; im->size = img_bytes(f, im->w, im->h, im->d, im->mips, layers, samples);
         OLOG("CreateImage %p %ux%ux%u format %d levels %u layers %u usage %#x", (void *)im, im->w, im->h, im->d, ci->format, im->mips, layers, ci->usage);
         *out = im;
@@ -861,6 +909,7 @@ VKB(vkCreateImageView, VkResult, VkDevice d, const VkImageViewCreateInfo *ci, co
     (void)d; (void)a;
     VkImage im = ci->image; const fmt_t *f = fmt_of(ci->format);
     MTLPixelFormat pf = f && f->pf != MTLPixelFormatInvalid ? f->pf : im->f->pf;
+    if (im->bcm) { MTLPixelFormat vpf; int vb; if (bc_store(ci->format, im->type, im->samples, &vpf, &vb)) pf = vpf; else if (!f || f->kind == K_BLOCK) pf = im->tex.pixelFormat; }   // no BC: the view takes the stand-in format of its BC format (a view format of its own class, as the sRGB one of a UNORM image)
     const VkImageSubresourceRange *r = &ci->subresourceRange;
     if (r->aspectMask == VK_IMAGE_ASPECT_STENCIL_BIT && pf == MTLPixelFormatDepth32Float_Stencil8) pf = MTLPixelFormatX32_Stencil8;
     uint32_t lv = r->levelCount == VK_REMAINING_MIP_LEVELS ? im->mips - r->baseMipLevel : r->levelCount;
@@ -1127,7 +1176,7 @@ VKB(vkCreateShaderModule, VkResult, VkDevice d, const VkShaderModuleCreateInfo *
     m->si = sh_find(m->key);
     @autoreleasepool {
         if (m->si && !m->si->geom_vp && g_lib) {
-            m->fn = [g_lib newFunctionWithName:[NSString stringWithFormat:@"vk_%s", m->key]];
+            { NSString *fnm = [NSString stringWithFormat:@"vk_%s", m->key]; m->fn = [lib_of(fnm) newFunctionWithName:fnm]; }
         }
     }
     if (!m->fn && !(m->si && m->si->geom_vp)) LOG("[vk] [RED] shader %s (%zu bytes of SPIR-V) is not in the library", m->key, ci->codeSize);
@@ -1185,7 +1234,7 @@ static id<MTLFunction> spec_fn(id<MTLFunction> fn, const VkSpecializationInfo *s
             else RED1("specialization constant of Metal type %lu not handled", (unsigned long)c.type);
         }
     NSError *err = nil;
-    id<MTLFunction> f = [g_lib newFunctionWithName:fn.name constantValues:cv error:&err];
+    id<MTLFunction> f = [lib_of(fn.name) newFunctionWithName:fn.name constantValues:cv error:&err];
     if (!f) LOG("[vk] [RED] shader %s with its specialization constants: %s", fn.name.UTF8String, err.localizedDescription.UTF8String);
     return f;
 }
@@ -1212,7 +1261,7 @@ static VkPipeline pipe_make(const VkGraphicsPipelineCreateInfo *ci) {
                 id<MTLFunction> fn = m->fn;
                 if (geom_vp) {
                     fn = fn && topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST && max_viewports() > 1
-                        ? [g_lib newFunctionWithName:[NSString stringWithFormat:@"vk_%s_vp%d", m->key, geom_vp - 1]] : nil;
+                        ? ({ NSString *fnm = [NSString stringWithFormat:@"vk_%s_vp%d", m->key, geom_vp - 1]; [lib_of(fnm) newFunctionWithName:fnm]; }) : nil;
                     if (!fn) LOG("[vk] [RED] geometry viewport lowering unavailable for vertex shader %s at location %d (topology %d)", m->key, geom_vp - 1, topology);
                 }
                 pd.vertexFunction = spec_fn(fn, st->pSpecializationInfo); p->vs = m->si;
@@ -1220,7 +1269,7 @@ static VkPipeline pipe_make(const VkGraphicsPipelineCreateInfo *ci) {
             else if (st->stage == VK_SHADER_STAGE_FRAGMENT_BIT) {
                 if (dual && m->fn) {   // pipelines may be built on several threads
                     static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER; pthread_mutex_lock(&mu);
-                    if (!m->tried_d) { m->tried_d = 1; m->fn_d = [g_lib newFunctionWithName:[NSString stringWithFormat:@"vk_%s_d", m->key]]; }
+                    if (!m->tried_d) { m->tried_d = 1; NSString *fnm = [NSString stringWithFormat:@"vk_%s_d", m->key]; m->fn_d = [lib_of(fnm) newFunctionWithName:fnm]; }
                     pthread_mutex_unlock(&mu);
                 }
                 pd.fragmentFunction = spec_fn(dual && m->fn_d ? m->fn_d : m->fn, st->pSpecializationInfo); p->fs = m->si;
@@ -1682,6 +1731,28 @@ static id<MTLBlitCommandEncoder> blit(rs_t *s, uint32_t op) {
     end_comp(s);
     if (!s->be) s->be = [s->cb blitCommandEncoder];
     return s->be;
+}
+// No BC (bc_store): one buffer → image region of a BC image. The blocks are read from the (shared) staging buffer at submit time and converted on the CPU into a temporary buffer in the stand-in
+// format (ASTC 4x4 blocks, or decompressed texels), which the blit then copies into the texture. The temporary buffer is kept by the command buffer, as the buffers of C_UPDATE are
+static void copy_bc_to_image(id<MTLBlitCommandEncoder> be, VkImage im, id<MTLBuffer> sb, VkDeviceSize soff, NSUInteger bpr, NSUInteger bpi, const VkBufferImageCopy *r) {
+    const uint8_t *src = sb.contents;
+    if (!src) { RED1("no BC: the CPU cannot read the staging buffer of an upload to a BC image"); return; }
+    int is3d = im->type == VK_IMAGE_TYPE_3D; uint32_t w = r->imageExtent.width, h = r->imageExtent.height;
+    uint32_t nz = is3d ? r->imageExtent.depth : r->imageSubresource.layerCount; if (!nz || !w || !h) return;
+    int astc = im->bcm == BC_ASTC;
+    NSUInteger dpr = astc ? (NSUInteger)((w + 3) / 4) * 16 : (NSUInteger)w * im->bpp, dpi = dpr * (astc ? (NSUInteger)((h + 3) / 4) : h);   // the stand-in's row and slice sizes
+    id<MTLBuffer> tb = [g_dev newBufferWithLength:dpi * nz options:MTLResourceStorageModeShared];
+    if (!tb) { RED1("no BC: cannot make a %lu-byte buffer for an upload to a BC image", (unsigned long)(dpi * nz)); return; }
+    uint8_t *dst = tb.contents;
+    for (uint32_t z = 0; z < nz; z++) {
+        const uint8_t *zs = src + soff + z * bpi; uint8_t *zd = dst + z * dpi;
+        if (astc) nvn_bc2astc(im->nvnf, zs, bpr, w, h, zd, dpr); else nvn_bc_decode(im->nvnf, zs, bpr, w, h, zd, dpr);
+    }
+    if (is3d) [be copyFromBuffer:tb sourceOffset:0 sourceBytesPerRow:dpr sourceBytesPerImage:dpi sourceSize:MTLSizeMake(w, h, nz) toTexture:im->tex
+                destinationSlice:0 destinationLevel:r->imageSubresource.mipLevel destinationOrigin:MTLOriginMake(r->imageOffset.x, r->imageOffset.y, r->imageOffset.z)];
+    else for (uint32_t z = 0; z < nz; z++)
+        [be copyFromBuffer:tb sourceOffset:z * dpi sourceBytesPerRow:dpr sourceBytesPerImage:dpi sourceSize:MTLSizeMake(w, h, 1) toTexture:im->tex
+          destinationSlice:r->imageSubresource.baseArrayLayer + z destinationLevel:r->imageSubresource.mipLevel destinationOrigin:MTLOriginMake(r->imageOffset.x, r->imageOffset.y, 0)];
 }
 // The occlusion query running counts the render encoder there is, each from a slot of its own in the submit's visibility buffer. It may have begun outside a render pass (Vulkan lets a query span
 // from before a pass to after it: Super Mario 3D All-Stars' Sunshine, Hagi's GX) and a pass's encoder may be split for a copy: every encoder started while it runs gets a slot
@@ -2605,6 +2676,7 @@ static void replay_ops(rs_t *s, VkCommandBuffer cb) {
                     uint32_t rl = r->bufferRowLength ? r->bufferRowLength : r->imageExtent.width, ih = r->bufferImageHeight ? r->bufferImageHeight : r->imageExtent.height;
                     NSUInteger bpr = (NSUInteger)((rl + f->bw - 1) / f->bw) * f->bytes, bpi = bpr * ((ih + f->bh - 1) / f->bh);
                     int is3d = im->type == VK_IMAGE_TYPE_3D;
+                    if (im->bcm) { copy_bc_to_image(be, im, sb, x->src->off + r->bufferOffset, bpr, bpi, r); continue; }
                     MTLBlitOption opt = f->kind == K_DS ? (r->imageSubresource.aspectMask & VK_IMAGE_ASPECT_STENCIL_BIT ? MTLBlitOptionStencilFromDepthStencil : MTLBlitOptionDepthFromDepthStencil) : MTLBlitOptionNone;
                     for (uint32_t l = 0; l < (is3d ? 1 : r->imageSubresource.layerCount); l++)
                         [be copyFromBuffer:sb sourceOffset:x->src->off + r->bufferOffset + l * bpi sourceBytesPerRow:bpr sourceBytesPerImage:is3d || im->layers > 1 ? bpi : 0
@@ -2650,6 +2722,7 @@ static void replay_ops(rs_t *s, VkCommandBuffer cb) {
             case C_COPYI2B: {   // read-back into a buffer (shared storage: the CPU sees it once the submit's fence has signalled)
                 const c_copyi2b *x = c; VkImage im = x->src; const fmt_t *f = im->f;
                 if (!x->dst->mem || !im->tex) { RED1("the readback buffer has no bound memory or the image was not created"); break; }
+                if (im->bcm) { RED1("no BC: image format %d is stored as %s, so reading it back into a buffer would not give its BC blocks", im->fmt, im->bcm == BC_ASTC ? "ASTC" : "decompressed texels"); break; }
                 id<MTLBlitCommandEncoder> be = blit(s, h->op); id<MTLBuffer> db = mem_buf(x->dst->mem);
                 for (uint32_t i = 0; i < x->n; i++) {
                     const VkBufferImageCopy *r = &x->r[i]; int is3d = im->type == VK_IMAGE_TYPE_3D;

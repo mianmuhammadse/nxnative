@@ -812,6 +812,12 @@ t_vk_clear_attachments: t_vk_clear_attachments.m ../vk/hle_vk.m $(MTL_T_DEP)
 	clang $(CFLAGS) -I../../third_party/vulkan-headers/include -fobjc-arc -o $@ t_vk_clear_attachments.m $(MTL_T_SRC) ../nvn/nvn_mtl.m $(FW)
 check_t_vk_clear_attachments: RUN_ENV = MTL_DEBUG_LAYER=1 MTL_DEBUG_LAYER_VALIDATE_LOAD_ACTIONS=1
 check_t_vk_cmds: RUN_ENV = MTL_DEBUG_LAYER=1
+t_vk_bc: t_vk_bc.m ../vk/hle_vk.m $(MTL_T_DEP)
+	clang $(CFLAGS) -I../../third_party/vulkan-headers/include -fobjc-arc -o $@ t_vk_bc.m $(MTL_T_SRC) ../nvn/nvn_mtl.m $(FW)
+check_t_vk_bc: RUN_ENV = MTL_DEBUG_LAYER=1
+t_vk_libs: t_vk_libs.m ../vk/hle_vk.m $(MTL_T_DEP)
+	clang $(CFLAGS) -I../../third_party/vulkan-headers/include -fobjc-arc -o $@ t_vk_libs.m $(MTL_T_SRC) ../nvn/nvn_mtl.m $(FW)
+check_t_vk_libs: RUN_ENV = MTL_DEBUG_LAYER=1
 check_t_vk_compute: RUN_ENV = MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1
 check_t_vk_argbuf: RUN_ENV = MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1
 t_vk_renderdragon: t_vk_renderdragon.m ../vk/hle_vk.m $(MTL_T_DEP)
