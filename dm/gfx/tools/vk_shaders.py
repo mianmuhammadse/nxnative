@@ -20,6 +20,8 @@
 #     whose blend factors read source 1
 # Super Mario Galaxy generates its GX shaders at run time; they come from a capture folder (the Mac host's DM_VK_CAPTURE), read like a RomFS: every input folder is
 # searched for SPIR-V files by their magic
+# A Godot game's RomFS holds the SPIR-V of every shader variant in its shader cache (shader_cache/<family>/<hash>/<hash>.vulkan.cache, 'GDSC'): each stage is a zstd frame of
+# SMOL-V (dm/tools/smolv.py), read from the cache files directly, so Godot games need no capture
 # Output: <out>/vk/vk_shaders.metallib (and vk_shaders.1.metallib ... when there are more than DM_VK_LIB_SHADERS shaders) and <out>/vk/vk_shaders.tsv; --ios <dir> also writes <dir>/vk/ with an iPhone library (same table)
 # Table rows: key <TAB> stage (vert / frag / comp:x,y,z / geomvp:location) <TAB> resources, space-separated kind:set.binding=slot[*count]; lower-case u/b/t/s/c/p bind discrete buffers, textures, samplers and push constants;
 #   upper-case U/B/T/S are argument-buffer members, with @id after the slot and count for the first element's Metal ID;
@@ -39,6 +41,8 @@ MAGIC = 0x07230203
 SPIRV_MAGIC = struct.pack('<I', MAGIC)
 MATERIAL_MAGIC = struct.pack('<Q', 0x0A11DA1A)
 BGFX_SHADER = re.compile(rb'[VF]SH\x05|CSH\x03')
+GODOT_CACHE = b'GDSC'   # Godot's shader cache file (ShaderRD): its header, then the variants' binaries
+ZSTD_MAGIC = b'\x28\xb5\x2f\xfd'
 OP_DECORATE, OP_MEMBER_DECORATE, OP_TYPE_ARRAY, OP_TYPE_RTARRAY, OP_TYPE_STRUCT = 71, 72, 28, 29, 30
 DEC_ARRAY_STRIDE, DEC_BINDING, DEC_SET = 6, 33, 34
 DEC_BUILTIN, DEC_LOCATION = 11, 30
@@ -92,10 +96,29 @@ def shader_inputs(root):
             with open(p, 'rb') as fh: head = fh.read(8)
             if head.startswith(SPIRV_MAGIC): yield p, 'spirv'
             elif head == MATERIAL_MAGIC: yield p, 'material'
+            elif head.startswith(GODOT_CACHE) and p.endswith('.vulkan.cache'): yield p, 'godot'
+
+
+def godot_modules(data):
+    """The SPIR-V modules of a Godot shader cache file. Every stage of every variant is a zstd frame holding SMOL-V (or plain SPIR-V); the frames are found by their magic and kept
+    only when they decode to a whole module, so a chance match inside compressed data is dropped. Godot caches the same module in several variants' files: the caller dedups by key"""
+    try: import zstandard
+    except ImportError: red('Godot shader caches need the zstandard module (pip install zstandard, which nsz installs too)')
+    import smolv
+    pos = data.find(ZSTD_MAGIC)
+    while pos >= 0:
+        try: raw = zstandard.ZstdDecompressor().decompressobj().decompress(data[pos:])
+        except zstandard.ZstdError: raw = None
+        if raw is not None:
+            try: module = smolv.decode(raw) if raw[:4] == b'LOMS' else raw
+            except ValueError: module = None
+            if module and whole_module(module, 0, len(module)): yield pos, module
+        pos = data.find(ZSTD_MAGIC, pos + 1)
 
 
 def embedded_modules(path, kind):
     with open(path, 'rb') as f: data = f.read()
+    if kind == 'godot': yield from godot_modules(data); return
     if kind == 'nso': data = nso.load(data, path).image
     yield from bgfx_modules(data)
 
