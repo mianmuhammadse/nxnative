@@ -11,8 +11,9 @@ app_category	public.app-category.games
 
 # ---- Versions ----
 build	v458752	1.0.7	main=b4f859ba44751f262ea66c4d5c5784a2	sdk=d83a56a5558798414c78ec722867a7da
-package	v458752
-shader_versions	v458752
+build	v589824	1.0.9	main=53e2366a73ef1a06f185c5d80c13d642	sdk=d83a56a5558798414c78ec722867a7da
+package	v589824
+shader_versions	v589824
 
 # ---- Files ----
 # not loaded, main takes nothing from them the host does not supply: subsdk0 (NintendoSDK_OpenGL), subsdk1 (NintendoSDK_Vulkan)

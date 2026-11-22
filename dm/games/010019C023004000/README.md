@@ -1,6 +1,6 @@
 # Until Then (`010019C023004000`)
 
-Update 1.0.7 (`v458752`) over the base release, SDK 19.3.9. A Godot game on its Vulkan renderer (`RenderingDevice`, the mobile forward renderer, canvas and particle shaders), run through the host's Vulkan layer. Loads `main` and `sdk`; `subsdk0` (NintendoSDK_OpenGL) and `subsdk1` (NintendoSDK_Vulkan) are replaced by the layer. The profile started as the NSP script's provisional one and was brought up on the Mac and an iPhone 15 (A16).
+Updates 1.0.7 (`v458752`) and 1.0.9 (`v589824`, current) over the base release, SDK 19.3.9; both share the `sdk` build. A Godot game on its Vulkan renderer (`RenderingDevice`, the mobile forward renderer, canvas and particle shaders), run through the host's Vulkan layer. Loads `main` and `sdk`; `subsdk0` (NintendoSDK_OpenGL) and `subsdk1` (NintendoSDK_Vulkan) are replaced by the layer. The profile started as the NSP script's provisional one and was brought up on the Mac and an iPhone 15 (A16).
 
 ## What it needs
 
@@ -20,6 +20,7 @@ Update 1.0.7 (`v458752`) over the base release, SDK 19.3.9. A Godot game on its 
 
 - **No BC textures.** The first iPhone run aborted one frame after the first present: the game's first BC3 image reached `MTLTextureDescriptor` with pixel format 134. The Vulkan layer now stores BC images as ASTC 4x4 or decompressed ([rendering](../../../docs/reference/rendering.md#gpus-without-bc-textures-are-refused-at-start), `t_vk_bc`); `DM_TEST_NO_BC=1` reproduces the path on a Mac.
 - **Current:** a run from a new game, about 102,300 frames (over 20 minutes), no crash. `7 shader libraries, 3359 functions` at start, no missing-shader line, every frame `skipped 0`. `phys_footprint` peaked at 1.02 GB. Sound works. Not measured: frame time and heat.
+- **1.0.9 (current):** a run with another player's save from chapter 6 (about 10,200 frames, no crash): `7 shader libraries, 3364 functions` (the cache holds 3,364 modules, five more than 1.0.7's), no missing-shader line, peak footprint 0.93 GB, audio underruns only in the first 2,000 callbacks (70 and 67). After Start the game compiles about 70,000 pipelines (64 at frame 1,200, 25,300 at 3,000, 70,677 at 6,600; no pipeline cache in this build, `Unsupported internal pipelines cache`), which is the wait before a scene appears; the log carries 70,677 `!new_pipelines_cache_size` errors, one per compile.
 
 ## Saves
 
@@ -27,7 +28,7 @@ A save from another player's emulator (Godot `user://` files: `savegame.res`, `s
 
 ## DLC: Afterimages (current: incomplete)
 
-The DLC (`010019C023005002`, v0, 0.62 GB) mounts (`aoc2`, 75,217 entries; the nsz check `[VERIFIED]` shows the dump is whole) but its scenes fail: opening Homecoming (`scenes/_dlc_rdvt/ch1sc1a`) logs `No loader found for resource: .../ch1sc1a/assets/logo.png`, and chapter 2 (`Ch2Sc1a`) lacks `SmoothOpaqueSimple.gdshader` and bike and motorcycle textures. The game then logs `Tried to change scene ... failed miserably` and `Until then...` and quits by itself. The files are in neither the DLC image nor the base RomFS (1.0.7, `v458752`, a Godot build dated 2026-06-09; the DLC came out on 2026-06-18). Another player's emulator runs Homecoming. Not known: whether a newer base update (1.0.9, `v589824`) or a DLC update carries them.
+The DLC (`010019C023005002`, v0, 0.62 GB: one data NCA of 651 MB; the nsz check `[VERIFIED]` shows the dump is whole) mounts (`aoc2`, 75,217 entries) but its scenes fail: opening Homecoming (`scenes/_dlc_rdvt/ch1sc1a`) logs `No loader found for resource: .../ch1sc1a/assets/logo.png`, and chapter 2 (`Ch2Sc1a`) lacks `SmoothOpaqueSimple.gdshader` and the bike and motorcycle textures under `chapter_global/envi/two_wheelers`. The game then logs `Tried to change scene ... failed miserably` and `Until then...` and quits by itself. The files, and their imported copies (`.godot/imported/<name>-<md5 of the res path>.ctex`), are in neither the DLC image nor the base RomFS, on 1.0.7 or 1.0.9. 1.0.9 adds 41 files and changes 43; one is `scenes/_dlc_rdvt/ch2sc9b/scripts/Precache.gd`, none is a missing asset. Another player's emulator runs Homecoming. Not known: whether a DLC update above v0 carries them, or whether the Switch release has the same gap.
 
 ## Open
 
@@ -35,5 +36,6 @@ The DLC (`010019C023005002`, v0, 0.62 GB) mounts (`aoc2`, 75,217 entries; the ns
 - **Audio (resolved, not a fault):** the one `[RED] AudioOut sample rate 44100` line is the game's probe: it opens a 44.1 kHz output, which fails with `0x699`, closes it, and opens the default (48 kHz) output at once (`audio #1`; `audio #2` is a second stream from `nro0`). Sound plays correctly on the iPhone (player's report, no glitches); the log shows 0 underruns. The audio session also failed once after the app was backgrounded and recovered.
 - **Swapchain size:** `surf_ext()` ignores the layer's size; `op_mode handheld` hides it. A fix would use `dm_vi_layer_size()`.
 - **Vulkan GL** still lacks the no-BC conversion.
-- **Imported saves** from the Mac (`savegame.res`, `settings.res`) were not confirmed to load on the phone; the last run started a new game.
-- **Mac validation:** the Mac host plays it (the shaders were captured there), but no timing run is recorded.
+- **Pipeline compile after Start:** about 70,000 pipelines are built each time before a scene shows (a minute or two on the iPhone). A prewarm list or a pipeline cache would remove it; not examined.
+- **DLC:** see above; needs a DLC version above v0, or confirmation that the Switch release lacks the files.
+- **Mac validation:** the Mac host plays it (1.0.7's shaders were captured there), but no timing run is recorded.
