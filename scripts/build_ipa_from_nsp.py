@@ -101,7 +101,6 @@ HEAP_CHECK_SECS = 30                    # the longest heap check (it stops at th
 HEAP_CHECK_NNMAIN_SECS = 5
 HEAP_CHECK_ROUNDS = 3                   # boots of the heap check: each fix of the heap region lets the next boot reach the checks behind it
 REGION_CHECK_NNMAIN_SECS = 15           # the address region check: the regions a game takes in nninitStartup and its first seconds in nnMain
-SWITCH_ALIAS = 0x1000000000             # the Switch's alias region (64 GB), which holds what a game reserves unchanged
 
 PROGRESS = 'auto'                       # stage lines on the console: 'bar' (one line per stage, redrawn in place), 'lines' (a plain line every BEAT seconds), 'off' (only each stage's start and end); 'auto' = bar in a terminal or Spyder, lines when the output goes to a file; 'json' = one JSON event per line, for a program that shows the build
 BEAT = 30                               # seconds between progress lines in 'lines' mode
@@ -2214,7 +2213,7 @@ def chain_tables(py, repo, sh, env, logs, g, chain):
         p = g.table(name)
         try: head = p.read_text(errors='replace').partition('\n')[0]
         except OSError: head = ''
-        if head.startswith(want + ' '): continue
+        if head == want or head.startswith(want + ' '): continue
         PROG.set(step=step)
         run([py, repo / 'dm/gfx/tools' / tool, lib, p], logs / f'{tool[:-3]}.log', env=dict(env, DMSH_TABLE_MEMO=str(sh / 'cache')))   # the shader build's memo (c1_guard.py)
         say(f'{name} ' + (f'named {" ".join(head.split()[2:5])}' if head.startswith('# chain ') else 'names no library' if head else 'missing') + f': made for {want[2:]} ({p})')
@@ -2287,8 +2286,8 @@ def checked_cap(g):   # the profile's stdalloc_cap row is the one an earlier reg
 
 
 def region_check(repo, d, patched, work, env, logs, g):
-    """The address region check of a provisional or derived profile whose game has virtual address memory: the game boots in the Mac host (headless and silent, no shader libraries) with a
-    Switch-sized alias region (DM_ALIAS_SIZE), so whatever it reserves fits, until it has run REGION_CHECK_NNMAIN_SECS in nnMain. The host's region table (DM_REGIONS, from the
+    """The address region check of a provisional or derived profile whose game has virtual address memory: the game boots in the Mac host (headless and silent, no shader libraries) with the
+    Mac host's console-sized alias region (64 GB for Switch 1, 128 GB for Switch 2), so whatever it reserves fits, until it has run REGION_CHECK_NNMAIN_SECS in nnMain. The host's region table (DM_REGIONS, from the
     observation gates the rewriter places in the sdk) says which regions the game took, where each request returns to in the game, through which SDK API and how much of it it used, and where they reach
     against the profile's alias region (profile_guess.py region_findings). A red line when they reach past it: on an iPhone a region would fail. The one fix it makes: when the
     regions made after a StandardAllocator region need more room than the host's cap leaves them, it sets stdalloc_cap (profile_guess.py stdalloc_room), unless the profile sets one
@@ -2300,7 +2299,8 @@ def region_check(repo, d, patched, work, env, logs, g):
     rmtree(rd); table.unlink(missing_ok=True)
     for x in ('save', 'temp', 'msl'): (rd / x).mkdir(parents=True)
     henv = dict(env, DM_ROMFS=str(rfs.source(d)), DM_SAVE=str(rd / 'save'), DM_TEMP=str(rd / 'temp'), DM_MSL_DIR=str(rd / 'msl'), DM_NVN_SHMAP=str(g.table('shader_map.tsv')),
-                DM_ALIAS_SIZE=f'{SWITCH_ALIAS:#x}', DM_REGIONS=str(table))
+                DM_KEEP_ALIAS_CUTS='1', DM_REGIONS=str(table))
+    henv.pop('DM_ALIAS_SIZE', None)   # let the Mac host supply its console-sized alias region (64 GB Switch 1, 128 GB Switch 2)
     PROG.set(step='booting the game')
     t0, seen = time.time(), {}
     def done():
@@ -2594,17 +2594,27 @@ def seen_keys(g, sh, logs):
 
 
 class ShaderWatch:
-    """Progress of dmsh_build.py, from the small JSON file it rewrites at most every half second (DMSH_PROGRESS): the cache check over every key, then the compile, which finishes the keys
-    in batches (cache hits and misses alike) and counts them. It used to be read from the files dmsh_build.py wrote, one per shader output, which it no longer leaves on disk"""
+    """Progress of dmsh_build.py, from the small JSON file it rewrites at most every half second and on every phase change (DMSH_PROGRESS): the cache check over every key, the compile
+    (plus any RT or mesh libraries), writing the library image(s), and, in a full build, the c1 guard and uniform read extent tables. It used to be read from the files dmsh_build.py
+    wrote, one per shader output, which it no longer leaves on disk"""
     def __init__(self, path): self.path = path
 
     def __call__(self):
         try: p = json.loads(self.path.read_text())
         except (OSError, ValueError): return None
+        step = p.get('step') or 'compiling'
         cached, misses = p.get('cached', 0), p.get('misses')
-        if p.get('step') == 'cache check':
-            return {'step': 'cache check', 'done': p['done'], 'total': p['total'], 'unit': 'shaders', 'note': f'{cached:,} cached'}
-        return {'step': 'compiling', 'done': p.get('done', 0), 'total': p.get('total', 0), 'unit': 'shaders', 'note': f'{misses:,} not cached' if misses else ''}
+        if step == 'cache check':
+            return {'step': step, 'done': p['done'], 'total': p['total'], 'unit': 'shaders', 'note': f'{cached:,} cached'}
+        if step == 'compiling':
+            return {'step': step, 'done': p.get('done', 0), 'total': p.get('total', 0), 'unit': 'shaders', 'note': f'{misses:,} not cached' if misses else ''}
+        out = {'step': step}
+        if 'done' in p: out['done'] = p['done']
+        if 'total' in p: out['total'] = p['total']
+        if p.get('unit'): out['unit'] = p['unit']
+        if p.get('bytes'): out['note'] = amount(p['bytes'], 'B')
+        elif p.get('note'): out['note'] = p['note']
+        return out
 
 
 def spirv_cross(repo, env=None):   # resolve the same selection the shader tools run, including an executable name on PATH
@@ -3484,6 +3494,7 @@ def main(args=None):
     env.setdefault('USER', getpass.getuser())   # xcodegen fails without USER (Couldn't find current username)
     env.setdefault('J', str(os.cpu_count() or 8))   # shader_split.py's and dmsh_build.py's workers (their default is 8)
     py = sys.executable
+    env['DM_PYTHON'] = py
     want = args.title_id or TITLE_ID
     if want and not re.fullmatch(r'[0-9A-Fa-f]{16}', want): raise BuildError(f'--title-id / TITLE_ID takes a title ID, 16 hex digits: {want}')
     if PROGRAM_INDEX and dump == 'folder': raise BuildError('--program / PROGRAM_INDEX picks a program from a multi-program application\'s NSPs or NUP; a dump folder is read as one program\'s files')
@@ -3745,7 +3756,8 @@ def main(args=None):
     if programs and romfs_mode == 'separate': raise BuildError('a game of several programs keeps its files in the app (ROMFS / --romfs bundle): Documents holds one RomFS image, one program\'s')
     if not prepare_xcode and free_gb(out_ipa.parent) < 5: raise BuildError(f'less than 5 GB free on the volume of {out_ipa.parent}')
     say('preparing the Xcode project' if prepare_xcode else f'building the IPA → {out_ipa}')
-    ipa_env = dict(env, GAME=g.id, W=str(work / 'ipa'), PATCHED=str(patched), ROMFS=str(romfs), MSL_IOS=str(ios), GFXAPI=gfx, FONT_PY=py, DM_DISPLAY_NAME=app_name, DM_BUNDLE_ID=bundle_id, AOC=str(aoc or ''), DM_XCODE_DERIVED_DATA=str(work / 'xcode-derived-data'), DM_TEAM_ID=team_id, DM_LANG=lang, CONTROL=str(control))
+    ipa_env = dict(env, GAME=g.id, W=str(work / 'ipa'), PATCHED=str(patched), ROMFS=str(romfs), MSL_IOS=str(ios), GFXAPI=gfx, DM_PYTHON=py, DM_DISPLAY_NAME=app_name, DM_BUNDLE_ID=bundle_id, AOC=str(aoc or ''), DM_XCODE_DERIVED_DATA=str(work / 'xcode-derived-data'), DM_TEAM_ID=team_id, DM_LANG=lang, CONTROL=str(control))
+    ipa_env.pop('FONT_PY', None)
     if prepare_xcode: ipa_env['DM_XCODE_PROJECT_DIR'] = str(project.parent)
     separate = romfs_mode == 'separate'
     if separate: ipa_env['DM_COPY_ROMFS'] = 'NO'; say('game files: separate (DM_COPY_ROMFS=NO), left out of the app; the image stays at ' + str(romfs))

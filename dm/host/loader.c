@@ -8,6 +8,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <limits.h>
+#include <dlfcn.h>
 #include <mach-o/getsect.h>
 #include <mach-o/ldsyms.h>
 #include "hle.h"
@@ -255,26 +256,65 @@ static int sdk_has_local_language_list(void) {
 static const hle_force_ent *g_force; static unsigned g_nforce; static unsigned *g_force_hits;
 static unsigned *g_fidx, g_fmask;   // name hash over the table: force_lookup runs for every named relocation, and each lookup used to strcmp its way through all 722 entries (the swhle table's scan is hashed the same way, hle.c)
 static const unsigned k_force_disabled = UINT_MAX;
-static void force_init(void) {
-    unsigned long sz; g_force = (const hle_force_ent *)getsectiondata(&_mh_execute_header, "__DATA", "swforce", &sz);
+static const char *force_entry_label(const hle_force_ent *e) {
+    if (e->to) return e->to;
+    Dl_info di;
+    if (e->fn && dladdr(e->fn, &di) && di.dli_sname) return di.dli_sname;
+    return "?";
+}
+static int force_build(int abort_on_error) {
+    unsigned long sz = 0; g_force = (const hle_force_ent *)getsectiondata(&_mh_execute_header, "__DATA", "swforce", &sz);
+    if (g_force && sz % sizeof *g_force) {
+        if (abort_on_error) die("forced takeover section size %lu is not a multiple of entry size %zu", sz, sizeof *g_force);
+        LOG("forced takeover section size %lu is not a multiple of entry size %zu", sz, sizeof *g_force);
+        g_force = NULL; g_nforce = 0;
+        return 1;
+    }
     g_nforce = g_force ? (unsigned)(sz / sizeof *g_force) : 0;
     g_force_hits = calloc(g_nforce + 1, sizeof *g_force_hits);
     unsigned cap = 16; while (cap < g_nforce * 2) cap <<= 1;
     g_fidx = calloc(cap, sizeof *g_fidx); g_fmask = cap - 1;
+    if (!g_force_hits || !g_fidx) die("forced takeover index allocation failed");
     int native_language_list = sdk_has_local_language_list();
+    int bad = 0;
     for (unsigned i = 0; i < g_nforce; i++) {   // insertion doubles as the duplicate check (a wrong list must still fail loudly, at once)
+        if (!g_force[i].name || !g_force[i].why || (!g_force[i].fn == !g_force[i].to)) {
+            if (abort_on_error) die("malformed forced takeover entry %u (%s)", i, g_force[i].name ? g_force[i].name : "(null)");
+            LOG("malformed forced takeover entry %u (%s)", i, g_force[i].name ? g_force[i].name : "(null)");
+            bad++; continue;
+        }
         if (native_language_list && (!strcmp(g_force[i].name, k_language_list) || !strcmp(g_force[i].name, k_language_count)))
             g_force_hits[i] = k_force_disabled;
         for (unsigned j = sym_hash(g_force[i].name) & g_fmask;; j = (j + 1) & g_fmask) {
             if (!g_fidx[j]) { g_fidx[j] = i + 1; break; }
-            if (!strcmp(g_force[g_fidx[j] - 1].name, g_force[i].name)) die("duplicate entry in the forced takeover list: %s", g_force[i].name);
+            if (!strcmp(g_force[g_fidx[j] - 1].name, g_force[i].name)) {
+                const hle_force_ent *prev = &g_force[g_fidx[j] - 1];
+                if (abort_on_error)
+                    die("duplicate entry in the forced takeover list: %s (%s and %s)", g_force[i].name, force_entry_label(prev), force_entry_label(&g_force[i]));
+                LOG("duplicate entry in the forced takeover list: %s (%s and %s)", g_force[i].name, force_entry_label(prev), force_entry_label(&g_force[i]));
+                bad++; break;
+            }
         }
     }
     for (unsigned i = 0; i < g_nforce; i++)   // an alias binds to the guest's definition: a target the host takes over would bypass that take-over
-        if (g_force[i].to)
+        if (g_force[i].name && !g_force[i].fn && g_force[i].to)
             for (unsigned j = sym_hash(g_force[i].to) & g_fmask; g_fidx[j]; j = (j + 1) & g_fmask)
-                if (g_force_hits[g_fidx[j] - 1] != k_force_disabled && !strcmp(g_force[g_fidx[j] - 1].name, g_force[i].to))
-                    die("forced alias %s: its target %s is itself taken over", g_force[i].name, g_force[i].to);
+                if (g_force_hits[g_fidx[j] - 1] != k_force_disabled && !strcmp(g_force[g_fidx[j] - 1].name, g_force[i].to)) {
+                    if (abort_on_error) die("forced alias %s: its target %s is itself taken over", g_force[i].name, g_force[i].to);
+                    LOG("forced alias %s: its target %s is itself taken over", g_force[i].name, g_force[i].to);
+                    bad++; break;
+                }
+    return bad;
+}
+static void force_init(void) { (void)force_build(1); }
+// Build-time self-check (`dmhost --check-tables`): validate the linked __DATA,swforce registrations without game files or a GPU, reporting every error before returning non-zero.
+int dm_check_tables(void) {
+    int bad = force_build(0);
+    if (!g_nforce) { LOG("forced takeover list is empty"); bad++; }
+    free(g_fidx); g_fidx = NULL; g_fmask = 0;
+    free(g_force_hits); g_force_hits = NULL;
+    g_force = NULL; g_nforce = 0;
+    return bad != 0;
 }
 static void *force_lookup(const char *name) {
     if (!g_fmask) return NULL;
@@ -307,6 +347,22 @@ static void force_check(void) {
 }
 
 // Read the rewriter table header (segment boundaries, slot numbers); any row beyond the header means an old-format build output (code modified at load time), which is rejected
+static int hex_nibble(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+static int parse_hex_bytes(const char *s, uint8_t *out, size_t n) {
+    for (size_t k = 0; k < n; k++) {
+        int hi = hex_nibble(s[2 * k]), lo = hex_nibble(s[2 * k + 1]);
+        if (hi < 0 || lo < 0) return 0;
+        out[k] = (uint8_t)((hi << 4) | lo);
+    }
+    return 1;
+}
+
 static void read_layout(module_t *m, const char *dir) {
     char path[1024]; snprintf(path, sizeof path, "%s/%s.fixups.tsv", dir, m->name);
     FILE *f = fopen(path, "r");
@@ -335,6 +391,15 @@ static void read_layout(module_t *m, const char *dir) {
         else if (!strcmp(key, "FPS_TARGET_PTR")) m->fps_target_ptr = v;
         else if (!strcmp(key, "FPS_TARGET_FIELD")) m->fps_target_field = (uint32_t)v;
         else if (!strcmp(key, "MONOLITH_INTERVAL")) m->monolith_interval = v;
+        else if (!strcmp(key, "ALIAS_CUT")) {
+            char ob[40], nb[40]; size_t n;
+            if (m->n_alias_cut == (int)(sizeof m->alias_cut / sizeof *m->alias_cut) || sscanf(line, "# %*s %*s %39s %39s", ob, nb) != 2 || (n = strlen(ob)) != strlen(nb) || !n || n % 2 || n > 32)
+                die("%s: bad ALIAS_CUT row: %s", path, line);
+            m->alias_cut[m->n_alias_cut].off = v; m->alias_cut[m->n_alias_cut].len = (uint8_t)(n / 2);
+            if (!parse_hex_bytes(ob, m->alias_cut[m->n_alias_cut].orig, n / 2) || !parse_hex_bytes(nb, m->alias_cut[m->n_alias_cut].cut, n / 2))
+                die("%s: bad ALIAS_CUT hex: %s", path, line);
+            m->n_alias_cut++;
+        }
         else if (!strcmp(key, "NATIVE_FPS_BLOCKED")) m->native_fps_blocked = v != 0;
         else if (!strcmp(key, "UE_FIXED_RATE_PTR")) m->ue_fixed_ptr = v;
         else if (!strcmp(key, "UE_FIXED_RATE_FIELD")) m->ue_fixed_field = (uint32_t)v;
@@ -934,6 +999,31 @@ static uint8_t *slurp(const char *path, size_t *n) {
     close(fd); *n = st.st_size; return p;
 }
 
+// Rewriter cuts marked ALIAS_CUT only exist to fit an iPhone's small alias region (mem_alias). On the Mac, whose alias region is at least the Switch's 64 GB (DM_SWITCH_ALIAS),
+// restore their original bytes while text is still writable so the game keeps its native reservation layout (docs/reference/memory.md). A smaller DM_ALIAS_SIZE (such as
+// build_ipa_from_nsp.py's heap check reproducing an iPhone layout) or DM_KEEP_ALIAS_CUTS=1 (region_check measuring the iPhone binary's reservations) keeps the cuts in place.
+static void undo_alias_cuts(module_t *m) {
+    if (!m->n_alias_cut) return;
+    const char *keep = getenv("DM_KEEP_ALIAS_CUTS");
+    if (keep && *keep && strcmp(keep, "0") != 0) {
+        LOG("%s: %d cuts for a small alias region kept (DM_KEEP_ALIAS_CUTS=%s)", m->name, m->n_alias_cut, keep);
+        return;
+    }
+    size_t a = dm_alias_size();
+    if (a < DM_SWITCH_ALIAS) {
+        LOG("%s: %d cuts for a small alias region kept (alias region %#zx, needs %#llx to restore)", m->name, m->n_alias_cut, a, (unsigned long long)DM_SWITCH_ALIAS);
+        return;
+    }
+    for (int i = 0; i < m->n_alias_cut; i++) {
+        uint8_t *p = m->base + m->alias_cut[i].off;
+        if (m->alias_cut[i].off > m->text_end || m->alias_cut[i].len > m->text_end - m->alias_cut[i].off ||
+            memcmp(p, m->alias_cut[i].cut, m->alias_cut[i].len) != 0)
+            die("%s: the cut at %#llx does not hold the bytes its ALIAS_CUT row names", m->name, (unsigned long long)m->alias_cut[i].off);
+    }
+    for (int i = 0; i < m->n_alias_cut; i++) memcpy(m->base + m->alias_cut[i].off, m->alias_cut[i].orig, m->alias_cut[i].len);
+    LOG("%s: %d cuts for a small alias region undone (alias region %#zx)", m->name, m->n_alias_cut, a);
+}
+
 // Seal the code area immediately after copying into anonymous pages (16 KB pages): [0, text_end) and the patch area are read-only+execute, and from then on any write to the code area crashes on the spot;
 // what lies between (ro and data on the same page can only go together) is writable
 static void map_image(module_t *m, const char *dir) {
@@ -952,7 +1042,7 @@ static void map_image(module_t *m, const char *dir) {
         if (a == MAP_FAILED) die("%s mmap %#llx", m->name, (unsigned long long)(pre + m->size));
         m->base = a + pre;
         memcpy(m->base, raw, fl); memcpy(a, raw + fl, sz - bl - fl); if (bl) memcpy(m->base + m->back_off, raw + sz - bl, bl);
-        free(raw); install_key_page(m);
+        free(raw); install_key_page(m); undo_alias_cuts(m);
         if (bl && mprotect(m->base + m->back_off, bl, PROT_READ | PROT_EXEC)) die("%s mprotect back patch", m->name);
         uint64_t rx = (m->text_end + 0x3FFF) & ~0x3FFFull;
         if (mprotect(m->base, rx, PROT_READ | PROT_EXEC)) die("%s mprotect text", m->name);
@@ -965,7 +1055,7 @@ static void map_image(module_t *m, const char *dir) {
     if (!slot && m->span_slot && m->span_len >= m->size) slot = m->span_slot;
     m->base = mmap(slot, m->size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON | (slot ? MAP_FIXED : 0), -1, 0);
     if (m->base == MAP_FAILED) die("%s mmap", m->name);
-    memcpy(m->base, raw, sz); free(raw); install_key_page(m);
+    memcpy(m->base, raw, sz); free(raw); install_key_page(m); undo_alias_cuts(m);
     uint64_t rx = (m->text_end + 0x3FFF) & ~0x3FFFull;
     if (mprotect(m->base, rx, PROT_READ | PROT_EXEC)) die("%s mprotect text", m->name);
     uint64_t po = m->patch_off & ~0x3FFFull;

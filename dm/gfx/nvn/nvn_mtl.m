@@ -3240,7 +3240,7 @@ static BOOL obj_is_tex(id object) {
     return is_texture;
 }
 
-static int g_red_once[178];   // one past the highest key: a new key raises this, and the macro refuses to compile otherwise
+static int g_red_once[179];   // one past the highest key: a new key raises this, and the macro refuses to compile otherwise
 #define RED_ONCE(k, ...) do { _Static_assert((k) < sizeof g_red_once / sizeof *g_red_once, "a RED_ONCE key past g_red_once: raise its size"); if (!g_red_once[k]++) MLOG("[RED] " __VA_ARGS__); } while (0)
 // NVN vertex streams 0–15 → Metal vertex buffer slots: 0–13 go to 16–29 (30 is the constant fallback buffer), 14 and 15 to 14 and 15. Metal has only the 31 slots 0–30; translated shaders use only buffer(0) (the argument buffer),
 // and the host's own vertex functions read no vertex buffers. 13 Sentinels uses stream 15, and the old 16 + stream went out of range (Metal assertion: buffer index (31) must be < 31)
@@ -3325,8 +3325,19 @@ void mtl_tex_init(const tex_t *t) {
 // sub, own: the submission of its last look at its pages and nvn_dirty_own_writes then (including sparse storage: sparse_checked)
 // ph, nph, up_frame, up_sub, missed: under DM_NVN_DIRTYCHECK, the hash of its bytes in each host page, the frame and submission of the upload, and whether a miss was reported (pkg_hash_take)
 // part: tex holds images copied from the texture it replaced (pkg_written), so through it from every upload back to the last whole one, when g_up_lost_gen was lost_gen
+static _Atomic uint64_t g_pkg_edge_allocs, g_pkg_edge_bytes, g_pkg_edge_peak_bytes, g_pkg_edge_fails, g_pkg_edge_fail_bytes;
+static void pkg_edge_heap_add(size_t n) {
+    atomic_fetch_add_explicit(&g_pkg_edge_allocs, 1, memory_order_relaxed);
+    uint64_t now = atomic_fetch_add_explicit(&g_pkg_edge_bytes, (uint64_t)n, memory_order_relaxed) + (uint64_t)n;
+    uint64_t peak = atomic_load_explicit(&g_pkg_edge_peak_bytes, memory_order_relaxed);
+    while (now > peak && !atomic_compare_exchange_weak_explicit(&g_pkg_edge_peak_bytes, &peak, now, memory_order_relaxed, memory_order_relaxed)) {}
+}
+static void pkg_edge_heap_sub(size_t n) {
+    atomic_fetch_sub_explicit(&g_pkg_edge_allocs, 1, memory_order_relaxed);
+    atomic_fetch_sub_explicit(&g_pkg_edge_bytes, (uint64_t)n, memory_order_relaxed);
+}
 @implementation NvPkg
-- (void)dealloc { defer_obj_release(tex); defer_obj_release(spare); if (eb) defer_obj_release(eb); else { free(edge[0]); free(edge[1]); } free(ph); }
+- (void)dealloc { defer_obj_release(tex); defer_obj_release(spare); if (eb) defer_obj_release(eb); else { for (int i = 0; i < 2; i++) if (edge[i]) { pkg_edge_heap_sub(edge_n[i]); free(edge[i]); } } free(ph); }
 @end
 static NSHashTable *g_ghost_dropped;   // the ghost entries a trim dropped (weak), to count how many are still alive after it
 static unsigned g_ghost_bufbacked;   // dropped ghost entries that were textures over a pool buffer (no memory of their own), for the trim's log line
@@ -3501,14 +3512,44 @@ static void pkg_edge_ranges(const tex_t *t, uintptr_t r[2][2], uintptr_t *ia, ui
     r[0][0] = a; r[0][1] = *ia; r[1][0] = *ie; r[1][1] = e;
 }
 static void pkg_edges_drop(NvPkg *pk) {
-    for (int i = 0; i < 2; i++) { if (!pk->eb) free(pk->edge[i]); pk->edge[i] = NULL; pk->edge_n[i] = 0; }
+    for (int i = 0; i < 2; i++) {
+        if (!pk->eb && pk->edge[i]) { pkg_edge_heap_sub(pk->edge_n[i]); free(pk->edge[i]); }
+        pk->edge[i] = NULL; pk->edge_n[i] = 0;
+    }
 }
 static void pkg_edges_take(NvPkg *pk, const tex_t *t) {   // right after an upload, with its stamp in pk->stamp
     pkg_edges_drop(pk);
     if (pk->sparse || !pk->span || !t->mem) return;
     uintptr_t r[2][2], ia, ie; pkg_edge_ranges(t, r, &ia, &ie);
-    for (int i = 0; i < 2; i++) if (r[i][1] > r[i][0]) { pk->edge_n[i] = (uint32_t)(r[i][1] - r[i][0]);
-        pk->edge[i] = pk->eb ? (uint8_t *)pk->eb.contents + (i ? r[0][1] - r[0][0] : 0) : malloc(pk->edge_n[i]); memcpy(pk->edge[i], (const void *)r[i][0], pk->edge_n[i]); }
+    size_t n0 = (size_t)(r[0][1] - r[0][0]), n1 = (size_t)(r[1][1] - r[1][0]);
+    uint8_t *eb_base = NULL;
+    if (pk->eb) {
+        eb_base = (uint8_t *)pk->eb.contents;
+        if (!eb_base || pk->eb.length < n0 + n1) {
+            atomic_fetch_add_explicit(&g_pkg_edge_fails, 1, memory_order_relaxed);
+            atomic_fetch_add_explicit(&g_pkg_edge_fail_bytes, (uint64_t)(n0 + n1), memory_order_relaxed);
+            RED_ONCE(178, "packaged-texture edge snapshot skipped (shared buffer %p len %lu < %zu, ser=%llu %ux%u format %#x): falling back to conservative re-upload",
+                     eb_base, (unsigned long)pk->eb.length, n0 + n1, (unsigned long long)t->serial, t->d.width, t->d.height, t->d.format);
+            return;
+        }
+    }
+    for (int i = 0; i < 2; i++) if (r[i][1] > r[i][0]) {
+        size_t n = (size_t)(r[i][1] - r[i][0]);
+        uint8_t *dst = eb_base ? eb_base + (i ? n0 : 0) : malloc(n);
+        if (!dst) {
+            atomic_fetch_add_explicit(&g_pkg_edge_fails, 1, memory_order_relaxed);
+            atomic_fetch_add_explicit(&g_pkg_edge_fail_bytes, (uint64_t)n, memory_order_relaxed);
+            RED_ONCE(178, "packaged-texture edge snapshot allocation failed (%zu bytes, edge %d of ser=%llu %ux%u format %#x, live edge snapshots %llu / %llu KB): falling back to conservative re-upload",
+                     n, i, (unsigned long long)t->serial, t->d.width, t->d.height, t->d.format,
+                     (unsigned long long)atomic_load_explicit(&g_pkg_edge_allocs, memory_order_relaxed),
+                     (unsigned long long)(atomic_load_explicit(&g_pkg_edge_bytes, memory_order_relaxed) >> 10));
+            pkg_edges_drop(pk);
+            return;
+        }
+        if (!eb_base) pkg_edge_heap_add(n);
+        pk->edge[i] = dst; pk->edge_n[i] = (uint32_t)n;
+        memcpy(dst, (const void *)r[i][0], n);
+    }
     // A write after the upload's stamp may have reached the copy but not the upload: then there is no copy to trust, and the next write re-uploads as before
     if (nvn_dirty_since_span(pk->span, t->mem, t->L.size, pk->stamp)) pkg_edges_drop(pk);
 }
@@ -3524,9 +3565,13 @@ static id<MTLBuffer> pkg_edges_gpu(NvPkg *pk, const tex_t *t, uint64_t *e0n, uin
     if (!n0 && !n1) return nil;
     if (!pk->eb) {
         id<MTLBuffer> b = [g_dev newBufferWithLength:n0 + n1 options:MTLResourceStorageModeShared];
-        if (!b) return nil;
+        if (!b || !b.contents) return nil;
         res_add(b);
-        for (int i = 0; i < 2; i++) if (pk->edge_n[i]) { memcpy((uint8_t *)b.contents + (i ? n0 : 0), pk->edge[i], pk->edge_n[i]); free(pk->edge[i]); pk->edge[i] = (uint8_t *)b.contents + (i ? n0 : 0); }
+        for (int i = 0; i < 2; i++) if (pk->edge_n[i]) {
+            memcpy((uint8_t *)b.contents + (i ? n0 : 0), pk->edge[i], pk->edge_n[i]);
+            if (pk->edge[i]) { pkg_edge_heap_sub(pk->edge_n[i]); free(pk->edge[i]); }
+            pk->edge[i] = (uint8_t *)b.contents + (i ? n0 : 0);
+        }
         pk->eb = b;
     }
     *e0n = n0; if (n1) { *e1s = r[1][0] - (uintptr_t)t->mem; *e1n = n1; }
@@ -6156,6 +6201,7 @@ static void mem_cache_counts(unsigned *pso, unsigned *cps, unsigned *shc);   // 
 // The frame hook samples every 300 frames. For the first 400 reports, a change of at least 64 MB in resident or GPU allocated memory also triggers a report. After 400 reports, log every 3000 frames.
 // All integers (the frame hook runs on the guest thread's small stack, so no floating-point formatting).
 static _Atomic uint64_t g_gptr_bindings, g_gptr_reads, g_gptr_added, g_gptr_bytes;   // gmem_discover: bindings with sources, readable words, newly addressed logical pool/run ranges and bytes
+static _Atomic uint64_t g_lib_data_n, g_lib_data_bytes, g_lib_data_fails, g_lib_data_fail_bytes;
 void mtl_mem_stat(unsigned long long frame, unsigned long long rss_mb) {
     static unsigned long long last_rss, last_gpu, last_frame, last_wired; static int lines; unsigned long long gpu = (unsigned long long)(g_dev.currentAllocatedSize >> 20);
     sys_mem_t sm = sys_mem();
@@ -6182,8 +6228,10 @@ void mtl_mem_stat(unsigned long long frame, unsigned long long rss_mb) {
 #if TARGET_OS_IPHONE
     snprintf(avail, sizeof avail, "%llu MB", (unsigned long long)(os_proc_available_memory() >> 20));
 #endif
-    MLOG("memory up to frame %llu: resident %llu MB, GPU allocated %llu MB, deferred-release queue %lu, residency set %lu, serial objects %u, memory pools %d (resident %d; peak %d / tracking table capacity %d; freed but alive %lu, %llu MB), shared textures %u (%u kept by the sharing table alone, %llu MB, %llu MB of it drawn into or shader-written, the oldest idle %llu submissions; evicted with pools %llu (serial entries that went with them %llu), on storage takeover %llu in total), texture re-uploads %llu in total, per-frame arena blocks created %llu in total (alive %llu, %llu MB; released when idle %llu, %llu MB in total), finalized textures still referenced %u (small table, %llu put in total), retired but held by a serial %u, recycled texture heaps made %llu, reused %llu, freed %llu, waiting %u (%llu MB); headroom to the system memory limit %s", frame, rss_mb, gpu, nd, nr, ns, live, pres, peak, cap, dead_n, dead_mb, ashared, au.entries, (unsigned long long)(au.bytes >> 20), (unsigned long long)(au.writable_bytes >> 20), (unsigned long long)au.oldest_idle, (unsigned long long)as.evicted, (unsigned long long)as.pool_entries, (unsigned long long)as.taken, (unsigned long long)g_pkg_reuploads, (unsigned long long)g_arena_made, (unsigned long long)g_arena_live, (unsigned long long)(g_arena_live_bytes >> 20), (unsigned long long)g_arena_freed, (unsigned long long)(g_arena_freed_bytes >> 20), nghost, (unsigned long long)ghost_puts, nwait,
-         (unsigned long long)g_rh_made, (unsigned long long)g_rh_reused, (unsigned long long)g_rh_trimmed, rh_n, (unsigned long long)(rh_bytes >> 20), avail);
+    MLOG("memory up to frame %llu: resident %llu MB, GPU allocated %llu MB, deferred-release queue %lu, residency set %lu, serial objects %u, memory pools %d (resident %d; peak %d / tracking table capacity %d; freed but alive %lu, %llu MB), shared textures %u (%u kept by the sharing table alone, %llu MB, %llu MB of it drawn into or shader-written, the oldest idle %llu submissions; evicted with pools %llu (serial entries that went with them %llu), on storage takeover %llu in total), texture re-uploads %llu in total, per-frame arena blocks created %llu in total (alive %llu, %llu MB; released when idle %llu, %llu MB in total), finalized textures still referenced %u (small table, %llu put in total), retired but held by a serial %u, recycled texture heaps made %llu, reused %llu, freed %llu, waiting %u (%llu MB), shader library data %llu (%llu MB; failed %llu / %llu KB); headroom to the system memory limit %s", frame, rss_mb, gpu, nd, nr, ns, live, pres, peak, cap, dead_n, dead_mb, ashared, au.entries, (unsigned long long)(au.bytes >> 20), (unsigned long long)(au.writable_bytes >> 20), (unsigned long long)au.oldest_idle, (unsigned long long)as.evicted, (unsigned long long)as.pool_entries, (unsigned long long)as.taken, (unsigned long long)g_pkg_reuploads, (unsigned long long)g_arena_made, (unsigned long long)g_arena_live, (unsigned long long)(g_arena_live_bytes >> 20), (unsigned long long)g_arena_freed, (unsigned long long)(g_arena_freed_bytes >> 20), nghost, (unsigned long long)ghost_puts, nwait,
+         (unsigned long long)g_rh_made, (unsigned long long)g_rh_reused, (unsigned long long)g_rh_trimmed, rh_n, (unsigned long long)(rh_bytes >> 20),
+         (unsigned long long)atomic_load_explicit(&g_lib_data_n, memory_order_relaxed), (unsigned long long)(atomic_load_explicit(&g_lib_data_bytes, memory_order_relaxed) >> 20),
+         (unsigned long long)atomic_load_explicit(&g_lib_data_fails, memory_order_relaxed), (unsigned long long)(atomic_load_explicit(&g_lib_data_fail_bytes, memory_order_relaxed) >> 10), avail);
     if (sm.ok) { char pl[220]; mem_pressure_said(pl, sizeof pl);
         MLOG("system memory at frame %llu: free %llu MB, wired %llu MB, compressed %llu MB, file-backed %llu MB, purgeable %llu MB, of %llu MB; residency set %llu MB; %s", frame,
              (unsigned long long)sm.free, (unsigned long long)sm.wired, (unsigned long long)sm.compressed, (unsigned long long)sm.file, (unsigned long long)sm.purgeable, (unsigned long long)sm.total,
@@ -6225,6 +6273,13 @@ void mtl_mem_stat(unsigned long long frame, unsigned long long rss_mb) {
 void mtl_pkg_stats(uint64_t *uploads, uint64_t *reuploads) { *uploads = g_pkg_uploads; *reuploads = g_pkg_reuploads; }
 void mtl_spare_stats(uint64_t *held, uint64_t *trimmed, uint64_t *trimmed_mb) { *held = atomic_load(&g_spare_held); *trimmed = atomic_load(&g_spare_trimmed); *trimmed_mb = atomic_load(&g_spare_trimmed_bytes) >> 20; }
 uint64_t mtl_pkg_edge_skips(void) { return g_pkg_edge_skips; }
+void mtl_pkg_edge_stats(uint64_t *allocs, uint64_t *bytes, uint64_t *peak_bytes, uint64_t *fails, uint64_t *fail_bytes) {
+    if (allocs) *allocs = atomic_load_explicit(&g_pkg_edge_allocs, memory_order_relaxed);
+    if (bytes) *bytes = atomic_load_explicit(&g_pkg_edge_bytes, memory_order_relaxed);
+    if (peak_bytes) *peak_bytes = atomic_load_explicit(&g_pkg_edge_peak_bytes, memory_order_relaxed);
+    if (fails) *fails = atomic_load_explicit(&g_pkg_edge_fails, memory_order_relaxed);
+    if (fail_bytes) *fail_bytes = atomic_load_explicit(&g_pkg_edge_fail_bytes, memory_order_relaxed);
+}
 uint64_t mtl_pkg_miss(void) { return g_pkg_miss; }
 static void treg_retire_serial(uint64_t ser);
 void mtl_tex_release(tex_t *t) {
@@ -7330,6 +7385,12 @@ static void shmap_read_once(void) { static dispatch_once_t once; dispatch_once(&
 // That, then the prewarm (warm_start) once: the submit thread and the tools only. The flag is set before warm_start runs, so a call from inside it (pso_prebuild) returns at
 // once; inside the dispatch_once that call re-entered it and libdispatch aborted (Tears of the Kingdom and Pokémon Scarlet at boot, chain d0e99bd4b2fe)
 static void shmap_load(void) { shmap_read_once(); static int warmed; if (!warmed) { warmed = 1; warm_start(); } }
+// c1_full.tsv / cb_extent.tsv header match: exact "# chain b-<V> inputs <digest>", or followed by a space (older tables with a clock stamp)
+static BOOL table_head_ok(NSString *head, NSString *want) {
+    if (!head) return NO;
+    NSString *h = [head hasSuffix:@"\r"] ? [head substringToIndex:head.length - 1] : head;
+    return [h isEqualToString:want] || [h hasPrefix:[want stringByAppendingString:@" "]];
+}
 static void shmap_read(void) {
     if (g_shmap) return;
     const char *e = getenv("DM_NVN_SHMAP");
@@ -7365,8 +7426,8 @@ static void shmap_read(void) {
     NSString *cp = [[path stringByDeletingLastPathComponent] stringByAppendingPathComponent:@"c1_full.tsv"];   // Same directory as the mapping table (Mac: dm/games/<id>; iOS: dm/ inside the App, copied along by build_ipa.sh)
     NSString *ct = cp ? [NSString stringWithContentsOfFile:cp encoding:NSUTF8StringEncoding error:nil] : nil;
     NSString *head = ct ? [[ct componentsSeparatedByString:@"\n"] firstObject] : nil;
-    NSString *want = [NSString stringWithFormat:@"# chain b-%s inputs %@ ", DMSH_CHAIN, st_inputs ?: @"-"];   // a library without a stamp matches no table
-    if (!head || ![head hasPrefix:want]) {
+    NSString *want = [NSString stringWithFormat:@"# chain b-%s inputs %@", DMSH_CHAIN, st_inputs ?: @"-"];   // a library without a stamp matches no table
+    if (!table_head_ok(head, want)) {
         MLOG("[RED] c1_full.tsv is stale or missing (its header must name this library's chain and inputs; a full dmsh_build.py run makes it); every c1 gets its own 64 KiB");
     } else {
         g_c1_full_valid = 1; g_c1_full = [NSMutableSet set];
@@ -7376,7 +7437,7 @@ static void shmap_read(void) {
         NSString *xp = [[path stringByDeletingLastPathComponent] stringByAppendingPathComponent:@"cb_extent.tsv"];
         NSString *xt = [NSString stringWithContentsOfFile:xp encoding:NSUTF8StringEncoding error:nil];
         NSString *xh = xt ? [[xt componentsSeparatedByString:@"\n"] firstObject] : nil;
-        if (!xh || ![xh hasPrefix:want]) MLOG("cb_extent.tsv is stale or missing: uniform reads are taken to reach the whole binding");
+        if (!table_head_ok(xh, want)) MLOG("cb_extent.tsv is stale or missing: uniform reads are taken to reach the whole binding");
         else { NSMutableDictionary *d = [NSMutableDictionary dictionary];
             for (NSString *line in [xt componentsSeparatedByString:@"\n"]) { if (!line.length || [line hasPrefix:@"#"]) continue;
                 NSRange t = [line rangeOfString:@"\t"]; if (t.location != NSNotFound) d[[line substringToIndex:t.location]] = [line substringFromIndex:t.location + 1]; }
@@ -7549,11 +7610,22 @@ static NSString *lib_digest(const void *p, size_t n) {
 // Owned data can use malloc's existing arenas when new file mappings have no gap; the tradeoff is charged memory instead of reclaimable file pages.
 // The descriptor is closed promptly too: newLibraryWithURL keeps one open per library and exceeded iOS's soft limit of 256. The digest still names the original library bytes.
 static id<MTLLibrary> lib_from_map(msl_map f, NSError **err) {
-    NSString *tag = lib_digest(f.data, f.size);
-    dispatch_data_t d = dispatch_data_create(f.data, f.size, NULL, DISPATCH_DATA_DESTRUCTOR_DEFAULT);
+    size_t sz = f.size;
+    NSString *tag = lib_digest(f.data, sz);
+    dispatch_data_t d = dispatch_data_create(f.data, sz, NULL, DISPATCH_DATA_DESTRUCTOR_DEFAULT);
     munmap(f.base, f.base_len);
-    if (!d) { if (err) *err = [NSError errorWithDomain:NSPOSIXErrorDomain code:ENOMEM userInfo:nil]; return nil; }
-    return lib_tag([g_dev newLibraryWithData:d error:err], tag);
+    if (!d) {
+        atomic_fetch_add_explicit(&g_lib_data_fails, 1, memory_order_relaxed);
+        atomic_fetch_add_explicit(&g_lib_data_fail_bytes, (uint64_t)sz, memory_order_relaxed);
+        if (err) *err = [NSError errorWithDomain:NSPOSIXErrorDomain code:ENOMEM userInfo:nil];
+        return nil;
+    }
+    id<MTLLibrary> lib = lib_tag([g_dev newLibraryWithData:d error:err], tag);
+    if (lib) {
+        atomic_fetch_add_explicit(&g_lib_data_n, 1, memory_order_relaxed);
+        atomic_fetch_add_explicit(&g_lib_data_bytes, (uint64_t)sz, memory_order_relaxed);
+    }
+    return lib;
 }
 static id<MTLLibrary> lib_from_file(NSString *path, NSError **err) {
     int fd = open(path.fileSystemRepresentation, O_RDONLY); struct stat st;
@@ -8091,6 +8163,8 @@ static int *g_treg_transient; static size_t g_ntreg_transient, g_treg_transient_
 // Lock-free copy of texture ID → serial (the replay hot path only needs the serial): texture IDs are 20 bits, fixed 1M entries (BSS, only touched pages are used),
 // release write at registration, relaxed atomic read on the reader side, without entering g_rmu (the former h_ser locked and unlocked on every lookup, thousands of times per frame in the camp)
 static _Atomic uint64_t g_tser[1 << 20];
+static inline uint64_t tid_ser(int tid) { return tid > 0 && tid < (1 << 20) ? atomic_load_explicit(&g_tser[tid], memory_order_relaxed) : 0; }
+static inline uint64_t h_ser(uint64_t h) { return tid_ser((int)(h & 0xfffff)); }
 static samp_par *g_sreg; static uint8_t *g_sreg_ok; static void **g_sview; static uint64_t *g_srid; static int g_nsreg;   // g_sview: sampler ID → MTLSamplerState (retained)
 static void **g_sview_w; static uint64_t *g_srid_w; static float (*g_sbk)[4];   // a sampler's twin for a border colour Metal lacks (retained, NULL = none) and the shader's factors k (see nvn_border.h)
 static _Atomic int g_border_any;   // a sampler needing corrections has been registered (sticky). Set before its lazy Metal creation, so its very first draw keeps the corrections
@@ -14938,9 +15012,7 @@ static int encode_args_full(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stag
                 else if (lead) RED_ONCE(119, "buffer image whose view starts %u elements before it (below Metal's view alignment), in shader %s (stage %d) with no offset table entry for it (an array of images, or past %d of them): its accesses land %u elements early",
                                         lead, sh->key, nvn_stage, DMSH_TBIAS_SLOTS, lead);
                 if (b->rw || b->atom) {
-                    os_unfair_lock_lock(&g_rmu);
                     tex_t bt = tid > 0 && tid < g_ntreg && g_treg[tid].ok ? g_treg[tid].t : (tex_t){0};
-                    os_unfair_lock_unlock(&g_rmu);
                     if (bt.mem && bt.d.target == NVN_TEXTURE_TARGET_BUFFER) {
                         int bw, bh, bpb = nvn_fmt_bpb(bt.d.format, &bw, &bh);
                         if (bpb) post_shadow_wb((uint64_t)(uintptr_t)bt.mem, (uint64_t)bt.d.width * (uint64_t)bpb);
@@ -15333,7 +15405,7 @@ static int state_op(uint32_t op, const void *a) {
                 break; }
             bh_fresh(b);
             if (passdump()) for (int k = 0; k < b->n; k++) { int tid = (int)(b->h[k] & 0xfffff); if (tid) PD("T %llu bind st%d slot%d tid=%d sid=%d ser=%llu%s", g_stat_pass + 1, b->stage, b->first + k, tid, (int)(b->h[k] >> 20),
-                tid < g_ntreg ? g_treg[tid].t.serial : 0ull, b->defer ? " deferred" : ""); }
+                tid_ser(tid), b->defer ? " deferred" : ""); }   // g_tser, not g_treg: the game thread reallocates g_treg under g_rmu (mtl_reg_tex) while this replay read takes no lock
             if (resource_range_fits(b->stage, b->first, b->n, NTEX) && memcmp(&S.tex[b->stage][b->first], b->h, 8 * b->n)) { memcpy(&S.tex[b->stage][b->first], b->h, 8 * b->n); args_dirty(b->stage); } break; }
         case OP_BIND_SAMP: { const p_bind_handles *b = a; bh_fresh(b); if (resource_range_fits(b->stage, b->first, b->n, 128) && memcmp(&S.samp[b->stage][b->first], b->h, 8 * b->n)) { memcpy(&S.samp[b->stage][b->first], b->h, 8 * b->n); args_dirty(b->stage); } break; }
         case OP_BIND_IMG: { const p_bind_handles *b = a; bh_fresh(b); if (resource_range_fits(b->stage, b->first, b->n, 32)) { if (memcmp(&S.img[b->stage][b->first], b->h, 8 * b->n)) { memcpy(&S.img[b->stage][b->first], b->h, 8 * b->n); args_dirty(b->stage); } } else RED_ONCE(31, "image slots out of range stage %d first %d count %d", b->stage, b->first, b->n); break; }
@@ -15731,10 +15803,6 @@ static int draw_samples_rt(NvProg *pr) {   // Keep storage-alias guards for reso
 // (character select page: grunge and particles both draw 28 / 27 level 0 + depth, with only levels 1 and 2 cleared in between).
 // Equivalence conditions (hoist only if all hold, otherwise leave as-is): the scan range has only draws, state and these clears, no copies / dispatches / texture clears / sub-lists; the cleared subresources (texture + level + layer)
 // are disjoint from this render pass's attachments; the cleared textures are neither on any current texture / image slot nor bound within the scan range (conservative: regardless of whether the program samples them); the scissor at the time of the clear covers the whole block (same requirement as executing at the original position)
-// A texture ID's serial, 0 when it holds no texture: the lock-free copy mtl_reg_tex writes beside the registration (g_tser), so the per-draw readers (the same-pass
-// feedback checks) take no g_rmu for it
-static inline uint64_t tid_ser(int tid) { return tid > 0 && tid < (1 << 20) ? atomic_load_explicit(&g_tser[tid], memory_order_relaxed) : 0; }
-static uint64_t h_ser(uint64_t h) { return tid_ser((int)(h & 0xfffff)); }
 static void rt_sub(const p_set_rt *r, int k, uint64_t *ser, int *lv, int *sl) {   // Subresource of attachment k (0–7 color, 8 depth)
     const tex_t *t = k == 8 ? r->depth : r->color[k]; const view_t *v = k == 8 ? &r->dview : &r->cview[k]; int hv = k == 8 ? r->has_dview : r->has_cview[k];
     *ser = t ? t->serial : 0; *lv = hv && v->set_levels ? v->base_level : 0; *sl = hv && v->set_layers ? v->min_layer : 0;
