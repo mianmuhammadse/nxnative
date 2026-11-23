@@ -11,6 +11,7 @@
 #include <mach-o/getsect.h>
 #include <mach-o/ldsyms.h>
 #include "hle.h"
+#include "../gfx/nvn/nvn_fstep.h"   // the state page's target and tick unit (FSTEP_UNIT_OFF, nvn_fstep_target_put)
 #if TARGET_OS_IPHONE
 #include <mach/mach.h>
 #endif
@@ -52,6 +53,9 @@ static void build_symhash(module_t *m);
 static void parse_dynamic(module_t *m) {
     uint32_t mod0 = *(uint32_t *)(m->base + 4);
     if (memcmp(m->base + mod0, "MOD0", 4)) die("%s: no MOD0", m->name);
+    int64_t bss_end = mod0 + (int64_t)*(const int32_t *)(m->base + mod0 + 12);
+    if (bss_end > 0 && (uint64_t)bss_end <= m->key_page_off)
+        m->guest_size = ((uint64_t)bss_end + 0xfff) & ~0xfffull;
     m->dyn = (const Elf64_Dyn *)(m->base + mod0 + *(int32_t *)(m->base + mod0 + 4));
     for (const Elf64_Dyn *d = m->dyn; d->d_tag; d++) switch (d->d_tag) {
         case DT_SYMTAB: m->symtab = (const Elf64_Sym *)(m->base + d->d_un.d_ptr); break;
@@ -108,6 +112,16 @@ static void *loaded_sym(const char *name) {   // caller holds g_modules_mu, or i
 void *guest_sym(const char *name) {
     pthread_rwlock_rdlock(&g_modules_mu); void *p = loaded_sym(name); pthread_rwlock_unlock(&g_modules_mu);
     return p;
+}
+void *guest_module_sym(uintptr_t base, const char *name) {
+    void *symbol = NULL;
+    pthread_rwlock_rdlock(&g_modules_mu);
+    for (int i = 0; i < g_nloaded; ++i) {
+        module_t *m = g_loaded[i];
+        if ((uintptr_t)m->base == base) { symbol = module_sym(m, name); break; }
+    }
+    pthread_rwlock_unlock(&g_modules_mu);
+    return symbol;
 }
 // For modules with the patch area before the base (patch_off < 0) addresses in the patch area count too, as for modules whose patch area follows the image (crash reports, the GC pause's "in guest code" test)
 module_t *module_of(const void *p) {
@@ -315,6 +329,7 @@ static void read_layout(module_t *m, const char *dir) {
         else if (!strcmp(key, "RENDER_SCALE")) m->render_scale_max = (uint32_t)v;
         else if (!strcmp(key, "MOVIE_NATIVE_COLOR_KEYS")) m->movie_native_color_keys = v == 1;
         else if (!strcmp(key, "STEP_MAX")) m->step_max = (uint32_t)v;
+        else if (!strcmp(key, "FRAME_STEP_120")) m->fstep_t120 = v != 0;
         else if (!strcmp(key, "UE_MALLOC_VT")) m->ue_malloc_vt = v;
         else if (!strcmp(key, "UE_MALLOC_SLOT")) m->ue_malloc_slot = (unsigned)v;
         else if (!strcmp(key, "FPS_TARGET_PTR")) m->fps_target_ptr = v;
@@ -350,30 +365,39 @@ static void read_layout(module_t *m, const char *dir) {
     if ((m->back_off || m->back_len) && (m->patch_off >= 0 || !m->back_len || m->back_off % 0x4000 || m->back_len % 0x4000 || m->back_off < m->key_page_off + m->key_page_size
                                          || m->back_off + m->back_len != m->image_size))
         die("%s: back patch area, but BACK_OFF / BACK_LEN missing or wrong", path);
+    // map_image seals [0, text_end rounded up to 16 KB) read + execute (and gen_embed.py puts it in __TEXT on iOS): data below that would be read-only and SIGBUS in relocate()
+    // (FINAL FANTASY VIII Remastered's Math.nro and Platform.nro). patch_nso.py moves ro and data up (mod_layout.py); stop here on a copy rewritten before that
+    if (m->data_off < ((m->text_end + 0x3FFF) & ~0x3FFFull))
+        die("%s: data at %#llx shares a 16 KB page with code (text ends at %#llx): rewrite the module again with dm/tools/patch_nso.py", m->name, (unsigned long long)m->data_off, (unsigned long long)m->text_end);
 }
 
 // Frame step state (the page after the key page, read-write; layout in patch_nso.py FRAME_STEP): the rewriter's stubs step the game by the host's whole vsyncs capped at this
-// target, 0 = the game's own interval logic. The profile's fps_target, overridden by DM_FPS_TARGET (0, 30 or 60); the graphics layer decides the steps and paces presents
-// (hle_nvn.c fstep_tick)
+// target, 0 = the game's own interval logic. The profile's fps_target, overridden by DM_FPS_TARGET (0, 30 or 60; 40 for a stub that takes ticks of 1/120 s, FRAME_STEP_120);
+// the graphics layer decides the steps and paces presents (hle_nvn.c fstep_tick)
 uint8_t *dm_fps_state;
 int dm_fps_step_max;   // the largest step the stubs give the game (STEP_MAX in its fixups table; 0 = FSTEP_MAX): the frame step holds frames and pays back within it (hle_nvn.c)
 static const char *g_fps_mod;   // the module holding the state page (for the log)
 static float g_render_scale_max = 1.0f;   // the render-scale stub's largest scale (RENDER_SCALE in its fixups table; 1 for a stub that only lowers the game's size)
+static int g_fstep_t120;                  // the frame step stub takes ticks of 1/120 s (the FRAME_STEP_120 capability): the page's unit (+0x38) is 120, and 40 fps is taken
 static void install_fps_state(module_t *m) {
     if (m->fps_state_off + 0x40 > m->size || m->fps_state_off < m->key_page_off + m->key_page_size) die("%s: frame step state page out of range", m->name);
     dm_fps_state = m->base + m->fps_state_off; g_fps_mod = m->name; dm_fps_step_max = (int)m->step_max;
     if (m->render_scale_max > 1) g_render_scale_max = (float)m->render_scale_max;
+    g_fstep_t120 = m->fstep_t120;
 }
 // The settings in the state page, written when the game starts (main.c, after host loading): on iOS the loading runs at app launch, before the launcher has set DM_FPS_TARGET and
 // DM_RENDER_SCALE (Launcher.swift), and nothing reads the page before the game runs
 void dm_fps_state_apply(void) {
     if (!dm_fps_state) return;
     const char *e = getenv("DM_FPS_TARGET"); int t = e ? atoi(e) : DM_GAME_FPS_TARGET;
-    if (t != 0 && t != 30 && t != 60) { LOG("[RED] DM_FPS_TARGET=%s: must be 0, 30 or 60; using the game's own frame step", e); t = 0; }
-    float f = (float)t; memcpy(dm_fps_state, &f, sizeof f);
-    // Render scale of the 3D views (the stubs at Tears of the Kingdom's main+0xd5cc0, Breath of the Wild's main+0x1266880, Hades II's render size): 1.0 keeps the game's own size
-    // and dynamic resolution; another factor fixes the size at that fraction (DM_RENDER_SCALE, 0.5 to the stub's largest scale: 1.0, or above for a stub that also raises it,
-    // Hades II's 3.0). Independent of the frame step: written at target 0 too
+    // The step's unit, before the target: 120 (ticks of 1/120 s) for a stub that takes them, fixed for the run (nvn_fstep.h FSTEP_UNIT_OFF); 0 = vsyncs of 1/60 s
+    uint32_t unit = g_fstep_t120 ? 120 : 0; __atomic_store_n((uint32_t *)(dm_fps_state + FSTEP_UNIT_OFF), unit, __ATOMIC_RELAXED);
+    if (t == 40 && !g_fstep_t120) { LOG("[RED] DM_FPS_TARGET=40: this build's frame step takes whole vsyncs of 1/60 s only (no FRAME_STEP_120 stub), so 25 ms frames cannot be stepped; using 30"); t = 30; }
+    if (t != 0 && t != 30 && t != 40 && t != 60) { LOG("[RED] DM_FPS_TARGET=%s: must be 0, 30%s or 60; using the game's own frame step", e, g_fstep_t120 ? ", 40" : ""); t = 0; }
+    nvn_fstep_target_put(dm_fps_state, (float)t);
+    // Render scale of the 3D views (the stubs at Tears of the Kingdom's main+0xd5cc0, Breath of the Wild's main+0x1266880, Hades II's render size, Ocarina of Time's view-size
+    // update): 1.0 keeps the game's own size and dynamic resolution; another factor fixes the size at that fraction (DM_RENDER_SCALE, 0.5 to the stub's largest scale: 1.0, or
+    // above for a stub that also raises it, Hades II's 3.0). Independent of the frame step: written at target 0 too
     const char *rs = getenv("DM_RENDER_SCALE"); float sc = 1.0f, hi = g_render_scale_max;
     if (rs) { char *end; sc = strtof(rs, &end); if (end == rs || *end || !(sc >= 0.5f && sc <= hi)) { LOG("[RED] DM_RENDER_SCALE=%s: must be 0.5 to %.1f; keeping the game's size", rs, hi); sc = 1.0f; } else LOG("%s: 3D views rendered at %.2f of the game's size (DM_RENDER_SCALE)", g_fps_mod, sc); }
     memcpy(dm_fps_state + 0x10, &sc, sizeof sc);
@@ -419,7 +443,7 @@ void dm_fps_state_apply(void) {
         }
     }
     char cap[32]; snprintf(cap, sizeof cap, ", capped at %d fps", t);
-    LOG("%s: frame step %s%s (%s)", g_fps_mod, !t ? "as the game sets it" : "in whole vsyncs decided by the host", t ? cap : "", e ? "DM_FPS_TARGET" : "game profile fps_target");
+    LOG("%s: frame step %s%s (%s)", g_fps_mod, !t ? "as the game sets it" : g_fstep_t120 ? "in ticks of 1/120 s decided by the host" : "in whole vsyncs decided by the host", t ? cap : "", e ? "DM_FPS_TARGET" : "game profile fps_target");
 }
 static void install_key_page(module_t *m) {
     if (m->key_page_off + m->key_page_size > m->size) die("%s: key page out of range", m->name);

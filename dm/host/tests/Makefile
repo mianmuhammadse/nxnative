@@ -89,6 +89,7 @@ run: $(B)/t_phone_motion $(B)/t_mii $(B)/t_net_eventfd $(B)/t_language $(B)/t_mo
 	TMPDIR="$(abspath $(B))" $(B)/t_cheats $(QUIET)
 	$(B)/t_nro
 	$(B)/t_symbols
+	$(B)/t_gates
 	$(B)/t_server_environment
 run: $(B)/t_nro
 run: $(B)/t_sync_wait
@@ -98,6 +99,12 @@ sync-wait: $(B)/t_sync_wait
 	$(B)/t_sync_wait
 .PHONY: sync-wait
 run: $(B)/t_symbols
+run: $(B)/t_gates
+$(B)/t_gates: t_gates.c ../hle.c ../hle.h ../dm.h $(GAME_H) | $(B)
+	$(CLANG) -O1 -g -Wall -Werror -Wno-unused-function -Wno-deprecated-declarations -I.. $(GINC) -o $@ t_gates.c
+.PHONY: gates
+gates: $(B)/t_gates
+	$(B)/t_gates
 run: $(B)/t_server_environment
 $(B)/t_server_environment: t_server_environment.c ../hle_offline.c ../hle_net.h ../hle.h ../dm.h $(GAME_H) | $(B)
 	$(CLANG) -O1 -g -Wall -Werror -Wno-unused-function -I.. $(GINC) -o $@ t_server_environment.c
@@ -323,7 +330,7 @@ $(B)/t_front_role: t_front_role.c ../front_role.h | $(B)
 	$(CLANG) -O1 -g -Wall -Werror -I.. -o $@ t_front_role.c
 $(B)/t_haptics: t_haptics.c ../hle_haptics.c ../hle_haptics.h ../dm_input.h | $(B)
 	$(CLANG) -O1 -g -Wall -Werror -I.. -o $@ t_haptics.c ../hle_haptics.c
-$(B)/t_haptics_apple: t_haptics_apple.m ../haptics_apple.m ../haptics_apple.h ../hle_haptics.c ../hle_haptics.h | $(B)
+$(B)/t_haptics_apple: t_haptics_apple.m ../haptics_apple.m ../haptics_apple.h ../hle_haptics.c ../hle_haptics.h ../pad_jc1.h ../pad_pro.h | $(B)
 	$(CLANG) -O1 -g -fobjc-arc -Wall -Werror -I.. -o $@ t_haptics_apple.m ../hle_haptics.c -framework Cocoa -framework GameController -framework CoreHaptics -framework IOKit
 $(B)/t_time: t_time.c ../hle_time.c ../hle_table.c ../hle.h ../dm.h $(GAME_H) | $(B)
 	$(CLANG) -O1 -Wall -Werror -Wno-unused-function -I.. $(GINC) -o $@ t_time.c ../hle_table.c
@@ -502,6 +509,8 @@ coverage:
 	rm -rf $(B)/cov/prof
 	LLVM_PROFILE_FILE="$(call cov_profile,$(B)/cov)" $(MAKE) -i B=$(B)/cov SAN="$(COV_FLAGS)" run
 	@$(call cov_export,$(B)/cov)
+# loader.c includes the frame step's header (FSTEP_UNIT_OFF, nvn_fstep_target_put)
+$(B)/t_symbols $(B)/t_nro: ../../gfx/nvn/nvn_fstep.h
 
 # Restored CoreMotion frame mapping, separate from upstream controller fusion.
 $(B)/t_phone_motion: t_phone_motion.c ../dm_motion.h | $(B)

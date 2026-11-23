@@ -740,9 +740,14 @@ def raw_noinline(msl, stage='cs'):
 
 # Work around SIGBUS in Apple's mesh backend at the macOS 26.6 minimum (issue #2825).
 # Keep SPIRV-Cross helpers with subgroup inputs out of line. Ordinary inlining can still crash on these helpers.
+# SPIRV-Cross hands those inputs to helpers by reference (thread uint& gl_SubgroupInvocationID). Once out of line, Apple's backend (-O1 and up, 26.6 and 27.0 minimums)
+# reads gl_SubgroupInvocationID through that reference as one value for the whole SIMD group when one noinline helper passes it on to another: Ocarina of Time's
+# scan helpers then gave every lane the same exclusive prefix sum, its mesh shaders wrote out of their groups and the GPU hung or faulted after loading a save.
+# Pass them by value: they are SPIR-V Input builtins, never written, so a copy has the same meaning.
 MESH_SUBGROUP_HELPER = re.compile(r'(?m)^static inline __attribute__\(\(always_inline\)\)(?=\n\w+ \w+\([^\n]*\bgl_Subgroup\w*\b)')
+MESH_SUBGROUP_REF = re.compile(r'\bthread (\w+)& (gl_Subgroup\w+)\b')
 def mesh_subgroup_noinline(msl):
-    return MESH_SUBGROUP_HELPER.sub('static __attribute__((noinline))', msl)
+    return MESH_SUBGROUP_REF.sub(r'\1 \2', MESH_SUBGROUP_HELPER.sub('static __attribute__((noinline))', msl))
 
 GATHER4 = 'template<typename T> static inline __attribute__((always_inline)) vec<T, 4> dm_gather4(T a, T b, T c, T d) { return vec<T, 4>(a, b, c, d); }\n'
 
@@ -925,8 +930,10 @@ static inline __attribute__((always_inline)) float4 dm_rop(float4 c, uint m)
     float4 s = m == %du ? float4(255.0f) : (m == %du ? float4(65535.0f) : float4(1023.0f, 1023.0f, 1023.0f, 3.0f));
     return rint(precise::clamp(c, 0.0f, 1.0f) * s) / s;   // precise: NaN goes to 0, as both store it; the product is float32's, rint rounds it to nearest even
 }
+constant bool dm_blend_off [[function_constant(%d)]];   // abi.BLEND_OFF_FC: the pipeline's blend words are both 0 (nvn_mtl.m fn_off), so nothing to fix up
 static inline __attribute__((always_inline)) void dm_blend0(thread main0_out& dm_o, constant dm_blend_state& dm_s)
 {
+    if (is_function_constant_defined(dm_blend_off) && dm_blend_off) return;
     uint m = dm_s.zero, r = dm_s.round;
     if ((m | r) == 0u) return;
 %s}
@@ -948,6 +955,6 @@ def blend_zero(msl):
     body, k = re.subn(r'^([ \t]*)return out;$', lambda m: f'{m.group(1)}dm_blend0(out, dm_blend);\n{m.group(1)}return out;', body, flags=re.M)
     if not k or k != n: return msl, 0
     bits, rb = abi.BLEND_ZERO_BITS, abi.BLEND_ROUND_BITS
-    helper = BLEND_ZERO % ((1 << bits) - 1, (1 << rb) - 1, abi.ROUND_8, abi.ROUND_16,
+    helper = BLEND_ZERO % ((1 << bits) - 1, (1 << rb) - 1, abi.ROUND_8, abi.ROUND_16, abi.BLEND_OFF_FC,
                            ''.join(f'    dm_o.{nm} = dm_rop(dm_bz(dm_o.{nm}, m >> {bits * c}u), r >> {rb * c}u);\n' for nm, c in cols))
     return msl[:e['start']] + helper + '\n' + msl[e['start']:e['head'] - 1] + (', ' if e['params'] else '') + BLEND_ZERO_PARAM + ')' + body + msl[e['end']:], k

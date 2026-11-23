@@ -23,8 +23,8 @@ FITS(queue_builder_t, NVNqueueBuilder);
 typedef struct { uint32_t magic; NVNdevice *dev; uint64_t submits; int origin_ll; uint64_t serial; } queue_t;  FITS(queue_t, NVNqueue);
 
 typedef struct { NVNdevice *dev; void *mem; uint64_t size; uint32_t flags; } pool_builder_t;  FITS(pool_builder_t, NVNmemoryPoolBuilder);
-// A virtual pool (flags 0x200) keeps its sparse state in vp (hle_nvn.c struct vpool, NULL for an aliased one); vmode: 0 not mapped yet, 1 aliased onto one physical pool, 2 sparse
-typedef struct { uint32_t magic, flags; uint8_t *mem; uint64_t size; struct vpool *vp; int vmode; } pool_t;   FITS(pool_t, NVNmemoryPool);
+// A virtual pool (flags 0x200) keeps its sparse state in vp (hle_nvn.c struct vpool, NULL for an aliased one); vmode: 0 not mapped yet, 1 aliased onto one physical pool, 2 sparse; asked: an address that puts the pool in the raw pool table was handed out (hle_nvn.c)
+typedef struct { uint32_t magic, flags; uint8_t *mem; uint64_t size; struct vpool *vp; int vmode; uint8_t asked; } pool_t;   FITS(pool_t, NVNmemoryPool);
 
 typedef struct { const pool_t *pool; int64_t off; int32_t n; } dpool_t;                       // Texture / sampler descriptor pool
 FITS(dpool_t, NVNtexturePool); FITS(dpool_t, NVNsamplerPool);
@@ -328,7 +328,7 @@ void mtl_mem_pressure_request(int tier, int reason);       // memory-pressure re
 void mtl_mem_pressure_tick(uint64_t frame);                 // every frame from the present thread: the headroom watermark every 30 frames
 void mtl_fps_set(int v);                                   // frame-rate override: 0 = auto, 30 / 60 = pinned (DM_FPS sets the first value); any thread
 int mtl_fps_user(void);                                    // the override now (0 / 30 / 60)
-int mtl_fps_target(void);                                   // target frame rate 30 / 60 / 120 (power-saving mode, DM_FPS, the game itself asking for 30, the 120 fps setting)
+int mtl_fps_target(void);                                   // target frame rate 30 / 40 / 60 / 120 (power-saving mode, DM_FPS, the game itself asking for 30, 40 fps in 1/120 s ticks, 120 fps)
 int mtl_warm_wait(int timeout_ms);
 int mtl_link_active(void);
 int mtl_link_wait_tick(int vsyncs, uint64_t timeout_ns);   // vsyncs = the game's present interval
@@ -347,6 +347,7 @@ void mtl_tex_release(tex_t *t);
 void mtl_tex_pin(uint64_t serial);
 void mtl_tex_unpin(uint64_t serial);
 void mtl_pkg_stats(uint64_t *uploads, uint64_t *reuploads);
+void mtl_spare_stats(uint64_t *held, uint64_t *trimmed, uint64_t *trimmed_mb);   // packaged textures holding a spare now; spares retired so far (spare_trim) and their MB
 unsigned mtl_cpu_tex_count(void);   // live textures the CPU writes (retired snapshots are excluded)
 uint64_t mtl_pkg_edge_skips(void);   // packaged texture checks that found only writes beside the texture (pkg_edges_clean)
 uint64_t mtl_pkg_miss(void);

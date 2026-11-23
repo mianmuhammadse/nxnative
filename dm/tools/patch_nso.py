@@ -23,7 +23,7 @@ if capstone.cs_version()[0] != 5:   # the rewriter uses Capstone 5's names (CS_A
     sys.exit(f'[RED] Capstone {capstone.__version__} is unsupported; the rewriter requires Capstone 5.x. Run: {shlex.join([sys.executable, "-m", "pip", "install", "capstone>=5,<6"])}')
 from capstone import *
 from capstone.arm64 import ARM64_OP_IMM, ARM64_OP_MEM, ARM64_OP_REG
-import nso, nso_asm, nso_syms
+import mod_layout, nso, nso_asm, nso_syms
 from nso_asm import *   # the instruction encoders (B, ADRP, LDRX, ...), shared with the per-build patch files
 
 # The NSP script terminates a failed or cancelled rewrite with SIGTERM. Exit through the pool's context manager so it reaps the workers too.
@@ -36,6 +36,11 @@ src, outdir, NAME = sys.argv[1], sys.argv[2], sys.argv[3]
 # An NSO, or an NRO (a module the game loads at run time with nn::ro, Super Smash Bros. Ultimate's fighter code), rewritten as an NSO of the same layout would be. nso.py checks the file
 # against its header before anything is allocated (a damaged module stops here with a [RED] line)
 MOD = nso.cli_read(src)
+ORIG_TEXT = bytes(MOD.image[:MOD.text_end])   # the text as the file has it, before any relayout, cut or site: <name>.changed.tsv compares against it
+# Horizon maps modules at 4 KB, Apple hosts at 16 KB (W^X / signed __TEXT): move writable data up by whole 4 KB pages when it would share the code's 16 KB page (mod_layout.py)
+try: MOD, _relayout_D, _relayout_notes = mod_layout.relayout_module(MOD)
+except mod_layout.Error as e: sys.exit(f'[RED] {NAME}: {e}')
+if _relayout_D: print(f'{NAME}: ' + '; '.join(_relayout_notes))
 bss = MOD.bss
 # Every jump between the patch area and the code is a B (±128 MB). A patch area appended after the image (with bss) cannot reach the code when it would start beyond 112 MB (leaving 16 MB for the patch area): Metroid Dread's main has about 1.8 GB of bss (the engine's static heap); Engage's main starts its patch area at about 103 MB and keeps it after the image.
 # The patch area then sits FRONT bytes before the module base (PATCH_OFF is negative), and the output file holds only text + ro + data (FILE_IMAGE_LEN) followed by the patch area; the loader supplies zero pages for bss and the key page (IMAGE_SIZE is the whole image).
@@ -63,7 +68,6 @@ if TWO:
 elif BIG_TEXT: FRONT = int(os.environ.get('DM_PATCH_FRONT', '0'), 0) or (0x8000000 - 0x10000 - MOD.text_end) & ~0xFFFF
 SPLIT = (0x8000000 - FRONT - 0x100000 if GAP else max(0x8000000 - FRONT - 0x100000, BACK_MIN)) if TWO else None
 IMG = MOD.image
-ORIG_TEXT = bytes(IMG[:MOD.text_end])   # the text as the file has it, before any cut or site: <name>.changed.tsv compares against it
 if not FAR: IMG.extend(bytes(bss))
 TEXT_END = MOD.text_end
 RO_OFF, DATA_OFF = MOD.segments[1][0], MOD.segments[2][0]
@@ -1462,8 +1466,9 @@ obs += region_obs
 # its stubs run them at the cap, and the host only paces its presents (its patches.py).
 # State page = the page after the key page (zero in the file, read-write in both loaders): +0 float target fps written by the loader (fps_target, DM_FPS_TARGET; 0 = every stub
 # runs the original instructions), +4 30 fps movie/cinematic flag, +8 double lead (TOTK), +0x10 float render scale (TOTK, BotW), +0x18 double game seconds (TOTK),
-# +0x20 u32 step in vsyncs (host; 0 = not decided yet), +0x24 u32 a step the game fixes itself (BotW's VFR override; 0 = none), +0x28 u32 AoC's vsyncs per update, marked by
-# its first stub (0 = off), +0x30 u64 vsyncs stepped (the stubs; logged by the host to check the game's speed), +0x40 u32 1 = the game's own dynamic resolution runs, 0 = its
+# +0x20 u32 step in vsyncs, or in the unit at +0x38 (host; 0 = not decided yet), +0x24 u32 a step the game fixes itself (BotW's VFR override; 0 = none), +0x28 u32 AoC's vsyncs per update, marked by
+# its first stub (0 = off), +0x30 u64 units stepped (the stubs; logged by the host to check the game's speed), +0x38 u32 the step's unit in ticks a second: 120 for a stub that
+# declares the FRAME_STEP_120 capability (Ocarina of Time's ratio stub; written by the loader, fixed for the run), 0 = vsyncs of 1/60 s, +0x40 u32 1 = the game's own dynamic resolution runs, 0 = its
 # stub holds full resolution (DM_DYNAMIC_RESOLUTION, written by the loader; the stub declares the DYNAMIC_RESOLUTION capability). Stub bodies assembled with clang
 # A build's stubs are FRAME_STEP[build ID](ctx) in its patches.py: ctx.here() / ctx.emit(word) assemble into the patch area, ctx.site(offset, original bytes) asserts a site and that it is
 # no rewrite site, ctx.put(offset, words, reason) writes it (listed with the cuts), ctx.state is the state page's offset, ctx.render_scale = n marks a render-scale stub that takes scales up to n (1: it only lowers the game's size),
