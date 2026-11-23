@@ -622,6 +622,14 @@ Frame pacing: the host's frame step, engine frame limiters, present intervals an
 - **Checked on** an M4 Pro MacBook Pro (ProMotion screen, macOS 27.2), 40 s title-screen runs with a 40 ms hitch every 600 frames (`DM_TEST_PRESENT_LAG=600,40`), game enqueue to target display p50 with `DM_PRESENT_DRAIN=0` → default: [Cuphead](../../dm/games/0100A5C00D162000/README.md) at 60 fps in a window 83 → 66 ms (a drain about 2 s after each hitch), at a 30 fps cap in a window 116 ms on the 30 Hz link → 66 ms on the 60 Hz one, at 60 fps in fullscreen switched to fixed 60 Hz 83 → 66 ms, at a 30 fps cap there 66 ms; in variable-refresh fullscreen (`DM_SCREEN_MATCH=0`) the 120 Hz link took 60 fps with no drain (50 ms), and the 30 Hz link at a 30 fps cap drained once in 40 s (116 ms, then 149 ms until the drain: the game ran 28.7–29.9 fps there, so the acquire rarely had room); [Fire Emblem: Three Houses](../../dm/games/010055D009F78000/README.md) menus at 60 fps 66–81 → 63–66 ms (15 drains in 130 s); [Mario Kart World](../../dm/games/0400C3F00006E000/README.md) title at the 60 setting 74–77 → 60–77 ms, game time 0.997–0.998 of real time against 1.000 (4–6 drains of one vsync each per 1,800 presents, taken out of the frame step), the same late frames and frame step changes.
 - **Not checked:** iOS; a game under load near its frame time with the drain (Mario Kart World's title has hitches of its own); a fixed-rate screen in a window; external screens.
 
+### Blocking inside nvnWindowAcquireTexture inflates a game's measured CPU frame time
+
+- **Symptom:** a game with its own dynamic present-interval controller (such as `sead::GameFrameworkNx`) locks at 30 fps (`the game sets present interval 1 → 2`) after a single slow frame and never returns to 60 fps even when the scene takes much less than 16.7 ms.
+- **Cause:** `nvnWindowAcquireTexture` blocked on the display-link / pacer wait and the swapchain slot's previous-present ticket before returning the texture index. On the console, `nvnWindowAcquireTexture` returns the index immediately and defers display-release readiness onto the returned `NVNsync`. Games that acquire the swapchain texture before recording draw work and measure their CPU frame time across `AcquireTexture` + `procDraw_` before calling `nvnSyncWait(acquire_sync, -1)` (Super Mario Bros. Wonder – Nintendo Switch 2 Edition: `main+0x1bba10` calls `AcquireTexture` at `0x1bbb2c`, records draw commands, records CPU time at `0x1bbb48`, and only then waits on `acquire_sync` in `waitDrawDone_` at `0x184704`) included the full `present_interval` vsync wait (33.3 ms at interval 2) in their CPU frame time, so their interval controller (`main+0x1bbee0`) could never step back from 2 to 1.
+- **Fix:** general, in the host (`hle_nvn.c`, `nvn_queue.inc`, `nvn_mtl.m`, `nvn_obj.h`, `nvn_queue.h`). When `nvnWindowAcquireTexture` receives a non-null `NVNsync *s`, it snapshots the slot's earliest display-release time (`o->avail[*idx]`) and takes ownership of the slot's previous-present receipt (`o->ticket[*idx]`, before any parallel presentation thread can overwrite it with the current frame's present), attaches a deferred acquire wait (`acq_wait_t`, `sync_t.fenced == 4`) to `s` and `win->pending_acq`, and returns immediately. `nvnSyncWait(s, timeout)` runs the pacing wait, waits for and releases the snapshotted previous-present receipt, and waits on the acquire GPU fence, handling zero-timeout polls (`link_ready`, `mtl_present_screen_ready`, `mtl_snap_acquire_ready`, `nvn_queue_present_ready`) and finite timeouts without consuming an unfinished wait. Games that never call CPU `nvnSyncWait(s)` (only `nvnQueueWaitSync`) drain their prior pending acquire at the next `nvnWindowAcquireTexture`, while `nvnQueueWaitSync` snapshots the previous-present receipt onto the queue continuation (`NQ_SYNC`) so the GPU still waits for the previous present's texture release before drawing into it. `nvnWindowAcquireTexture(..., NULL, ...)` and `nvnQueueAcquireTexture` keep synchronous pacing; `nvnWindowFinalize` waits for any active acquire wait and detaches pending state cleanly.
+- **Check:** `make -C dm/gfx/tests GAME=040015100B514001`: `t_link_ticks` (91 checks + 4 snap checks: deferred acquire takes 0 ticks/waits, zero and short finite timeouts return `TIMEOUT_EXPIRED` without consuming ticks, blocking `nvnSyncWait` takes exact interval ticks and returns `CONDITION_SATISFIED`, repeat wait returns `ALREADY_SIGNALED`, elapsed ticks satisfy a zero-timeout poll, an unwaited acquire drains at the next acquire, `nvnWindowFinalize` detaches cleanly), `t_nvn` (526 checks: concurrent `Present` behind an unsignaled GPU event before CPU `nvnSyncWait` does not deadlock, `nvnQueueWaitSync` without CPU `nvnSyncWait`, re-fencing and finalizing `fenced == 4`), `t_link_latch_cb` (19 checks), `t_present_snap` (all 12 subcommands with `MTL_DEBUG_LAYER=1`), `t_present_rescue` (167 checks), `t_gfx_suspend` (34 checks), `t_fstep`, and `t_rt_comp`; `scripts/regress.py check` full pass on The Binding of Isaac: Rebirth (`01009BC00C38A000`, NVN1) and Fast Fusion (`040041E0212AE000`, NVN2) on Apple M6 / macOS 27.2.1. Open: live gameplay retest on Super Mario Bros. Wonder – Nintendo Switch 2 Edition (`040015100B514001`) to verify 60 fps recovery after an interval-2 frame.
+- **Found on:** [Super Mario Bros. Wonder – Nintendo Switch 2 Edition](../../dm/games/040015100B514001/README.md#found-on-this-game) (reported in [PR #3014](https://github.com/seedds/nxnative/pull/3014) as locking at 30 fps on M3 Pro after a single slow frame).
+
 ## CPU cost and pacing
 
 ### Arena buffer ownership on allocation
@@ -679,6 +687,13 @@ Frame pacing: the host's frame step, engine frame limiters, present intervals an
 - **Fix:** for 8-byte keys `nvn_hm_get` loads the key as one word and compares words. The hash, probe order and answers are the same; puts and deletes are unchanged.
 - **Found on:** MacNativeGames commit `7431eb7` (38 of 55 samples of the serial lookup were `memcmp` in a Tears of the Kingdom profile). Here, a lookup in a 3,000-entry table of 8-byte keys takes 1.5 ns instead of 5.9 ns on an M4 Pro (`clang -O2`, 60 million lookups); no game frame has been measured.
 - **Check:** `t_hmap` checks 8- and 20-byte keys against a naive model through random puts, overwrites, deletes and clears.
+
+### Retain and release in every draw's helpers
+
+- **Symptom:** `objc_retain`, `objc_release` and `objc_retainAutoreleasedReturnValue` spread over the replay thread's samples, under small per-draw helpers.
+- **Cause:** ARC retains and releases every strong local and every returned object. The draw helpers named a program's shaders in strong locals, and `prog_get` and `pso_get` handed their objects over retained and autoreleased at each call, though the program, the serial table and the pipeline tables hold them for the whole draw.
+- **Fix:** those locals, and `cbuf_slot`'s and `enc_r_pso`'s object parameters, are `__unsafe_unretained`; `prog_get` and `pso_get` return plain pointers (`prog_get_ref`, `pso_get_ref`, bridged by macros). Records for the encode thread still retain what they name (`nvn_rec.h`), and a program with no serial is still autoreleased.
+- **Found on:** [Donkey Kong Bananza](../../dm/games/040074A01BF12000/README.md#found-on-this-game): ARC traffic was about 13 % of the replay thread on Layer 1400 (a Metal System Trace's time profile of the replay thread before these changes).
 
 ### Submissions handed to the GPU in segments
 
@@ -766,6 +781,13 @@ Frame pacing: the host's frame step, engine frame limiters, present intervals an
 - **Fix:** after closing the previous geometry run's encoders and landing deferred updates, check the existing `sub_cut` policy before preparing the next run. Its draw threshold, deferral exclusions, upload flush, final-fence lifetime and segment timestamp handling remain in force. This adds submissions at existing encoder boundaries without adding render passes. `DM_NVN_GEOMETRY_CUT=0` disables the additional checks; `DM_NVN_CUT=0` still disables draw-count cuts overall. GPU dependency and pixel checks pass with either policy.
 - **Found on:** [NieR:Automata US](../../dm/games/010056B015FE8000/README.md#library-shadow-sequence-and-geometry-ordering). In an alternating warmed workload of 1,024 geometry/query draws at 1080p, median CPU-encode-to-GPU-completion time falls from 11.605 to 7.800 ms; render passes stay at 17 and all query results agree. GPU execution is essentially unchanged (4.004 versus 4.007 ms), while CPU encoding rises from 6.971 to 7.268 ms: the gain is overlap, not reduced shader work. Gameplay improvement remains unmeasured.
 
+### The mesh stage's argument table set at every mesh draw
+
+- **Symptom:** one `setArgumentTable` record a geometry mesh draw on the encode thread, also for draws gathered into a run.
+- **Cause:** `geo_mesh_encode` set the mesh stage's table before deciding whether the draw joins a run (`geo_mesh_take`), whose flush (`geo_mesh_flush_`) sets it itself.
+- **Fix:** only a mesh draw that draws alone sets it (`geo_mesh_encode` in `nvn_geometry.inc`).
+- **Found on:** [Donkey Kong Bananza](../../dm/games/040074A01BF12000/README.md#found-on-this-game): about 2,500 mesh draws a frame on Layer 1400.
+
 ### Reusing upload staging after a slot completes
 
 - **Symptom:** CPU submission spikes during texture updates, with the residency log showing tens of MB of new private staging allocations per frame.
@@ -780,12 +802,26 @@ Frame pacing: the host's frame step, engine frame limiters, present intervals an
 - **Fix:** mapped, non-sparse RGBA16F 2D/cube arrays with at least 32 faces and dimensions at most 64×64 write all faces in one dispatch per mip. An RGBA16Uint view preserves the exact stored component bits, including half-float NaN payloads, without floating-point conversion. Temporary views live until GPU completion; direct targets participate in dropped-upload recovery. Initial fills retain their original texture and usage contract. Large images, other formats, linear/compressible layouts, multisampling and unaligned sources keep the staged path. `DM_NVN_DIRECT_UPLOAD=0` restores it for all uploads. `t_direct_upload.m` compares all mip/face bits after CPU edits and spare reuse, checks fallback and initial fills, and injects a lost direct upload; Metal validation passes 26,384 checks normally and 26,388 with recovery injection.
 - **Found on:** [NieR:Automata US](../../dm/games/010056B015FE8000/README.md#small-light-probe-array-uploads). Its 16×16×768, five-mip RGBA16F array needs five direct dispatches instead of 3,840 staged dispatches and 3,840 copies. In an alternating warmed benchmark on M4 Pro, CPU upload encoding plus commit falls from 3.916 to 0.0275 ms and upload GPU time from 1.802 to 0.0355 ms. Gameplay and terminal-screen improvement remain unmeasured.
 
+### Vertex streams the shader does not read looked up every draw
+
+- **Symptom:** `bind_vbufs`, and `mtl_gpu_addr` under it, a large share of the replay thread; the `[nvn] vertex bindings` line's address lookups many times the draws.
+- **Cause:** `bind_vbufs` and `pull_layout_fill` looked up, compared and bound every stream slot holding an address. A game leaves the streams of earlier meshes bound, so most were streams the draw's shader never reads.
+- **Fix:** only the streams the vertex shader's inputs read (`vs_streams`) are bound or laid out. The pipeline's vertex descriptor is built from the same inputs (`pso_desc`), so it names no other stream. With no vertex shader (a draw without one, or a unit test) every bound stream still is. Unread streams still count in `ubd_conflict` and `vbuf_prepare`, and their vertex-table slots keep what they held, which no pipeline of the draw reads.
+- **Found on:** [Donkey Kong Bananza](../../dm/games/040074A01BF12000/README.md#found-on-this-game): 14 of the 16 slots held an address at every draw; about 9 % of the replay thread on Layer 1400 (a Metal System Trace's time profile of the replay thread before these changes).
+
 ### Address to memory pool lookups by binary search
 
 - **Symptom:** the submit thread's CPU samples dominated by `mtl_addr` / `mtl_gpu_addr` (vertex buffers in `draw`, uniform buffers in `encode_args`).
 - **Cause:** with many memory pools alive, the lookups scanned them all for every buffer binding of every draw.
 - **Fix:** they try the last hit, then a binary search over pools sorted by start address (`pool_find`, rebuilt when pools are added or removed).
 - **Found on:** [The Legend of Zelda: Breath of the Wild](../../dm/games/01007EF00011E000/README.md): about 1,760 memory pools alive; a CPU sample of the submit thread had about 1,000 of its samples under those scans. Host submit time in the shrine went from 21 ms to 7 ms per frame (p50), the median frame from 38 ms to 21 ms.
+
+### Pool lookups by page missed with thousands of pools
+
+- **Symptom:** the replay thread's samples under `mtl_gpu_addr`'s cache misses: `pc_get`, then `pool_held` and its lock.
+- **Cause:** the per-thread cache (`t_pc`) was direct-mapped by 4 KB page with 1,024 slots. A pool of megabytes was found only from pages already seen and still kept, so a game binding from thousands of pools fell through to the global lock and the [binary search](#address-to-memory-pool-lookups-by-binary-search) again and again.
+- **Fix:** a second table direct-mapped by 64 KB region is looked at first (`pc_slot_w` in `nvn_mtl.m`), filled and cleared with the page table. Every entry is still checked against its pool's range (`pc_holds`), so only the hit rate changes. It costs about 57 KB more thread-local memory in each thread that looks pools up.
+- **Found on:** [Donkey Kong Bananza](../../dm/games/040074A01BF12000/README.md#found-on-this-game): about 3,500 pools; the lookups were about 5 % of the replay thread on Layer 1400 (a Metal System Trace's time profile of the replay thread before these changes).
 
 ### Argument blocks encoded again when only a uniform buffer moved
 
@@ -794,6 +830,13 @@ Frame pacing: the host's frame step, engine frame limiters, present intervals an
 - **Fix:** in `nvn_mtl.m`, for every NVN game. A change of what a stage's uniform slots point at, a binding (`OP_BIND_UBO`) or a deferred update over one (`ubd_dirty`), takes a uniform generation of its own (`g_args_ugen`, beside `g_args_gen` for any binding: [argument blocks valid by generation](rendering.md#an-argument-block-reused-after-another-shader-of-its-stage-encoded)). When only that generation moved since the block was written, the block of the same pass is still reusable, and the shader reads its uniform buffers only as uniforms (`args_cbuf_only`: an allow-list of binding kinds, decided once per shader; handles or addresses read out of a uniform buffer keep the full encode), the old block is copied to a new arena slot and only its uniform slots and their size table are written again. Both paths take a slot from `cbuf_slot` (the binding, a deferred update's shadow, a [zero-padded copy of a short binding](shaders.md#reads-past-a-uniform-bindings-size), or the zero bank) and the table from `cbsize_table`, so a patched block is the one a full encode would write. The resource check, a pass dump and stage 5 keep the full encode. `@args_patch` counts patched blocks.
 - **Found on:** [Donkey Kong Bananza](../../dm/games/040074A01BF12000/README.md#found-on-this-game), in the first form (binding changes only, no size table; [PR #1611](https://github.com/seedds/nxnative/pull/1611)): 7,094 full encodes a frame fell to 1,489 (5,645 patched); submit-thread instructions per draw 14.4k to 13.6k, 60 fps on both (M3 Pro, `scripts/bench.py`, 3 runs each, an early-game route the submit thread does not limit). The reuse was measured first in [issue #1290](https://github.com/seedds/nxnative/issues/1290). **Open:** the form here, with the size table and the deferred updates, is not measured on Bananza; the deferred updates matter most in Breath of the Wild (221 small updates of a uniform block a frame).
 - **Arena rollover fix:** the allocation must keep its own GPU address across allocating helpers: [An argument block points into another arena after a nested allocation](rendering.md#an-argument-block-points-into-another-arena-after-a-nested-allocation). The optimization remains enabled.
+
+### Per-draw checks walked every reflected binding
+
+- **Symptom:** `fb_prepare`, `fb_depth_rule`, `ubd_conflict_textures` and `ubd_conflict_sh` in the replay thread's samples, mostly in their own loops.
+- **Cause:** each walked all of the shader's reflected bindings at every draw and skipped the kinds it does not handle. A material's fragment shader has samplers and more beside each texture.
+- **Fix:** each shader keeps, made once, the indices of its texture and image bindings and of the bindings `ubd_conflict_sh` looks at (`sh_lists_make` in `nvn_mtl.m`). The loops walk those lists with the same conditions inside, and a shader with no texture binding skips `ubd_conflict_textures`' lock. The lists are published by a release store of `lists_nb`, read with acquire.
+- **Found on:** [Donkey Kong Bananza](../../dm/games/040074A01BF12000/README.md#found-on-this-game): 45 bindings at the 90th percentile, a third of them textures; the walks were about 7 % of the replay thread on Layer 1400 (a Metal System Trace's time profile of the replay thread before these changes).
 
 ### Main guest thread keeps inherited default QoS
 
@@ -987,6 +1030,13 @@ Frame pacing: the host's frame step, engine frame limiters, present intervals an
   - frame time unchanged (frame p50 33.2 ms, the game's 30 fps step), no red lines, the pictures right; GPU p50 16.65 → 15.65 ms, measured while another session ran a game on the same Mac, so not counted;
   - the submit thread standing on the deck (85–105 s, per-frame instructions fitted against draws a frame, at 2,180 draws): 73.93 → 73.06 M instructions a frame (−1.2 %), CPU p50 9.40 → 9.18 ms.
   - PR #2542's own run before PR #2482 (M4 Pro): 84,748 → 1,948 views made by frame 4,200.
+
+### Same-pass feedback views made at every draw
+
+- **Symptom:** `newTextureViewWithPixelFormat` under `fb_prepare` in the replay thread's samples, every frame.
+- **Cause:** a draw sampling its own attachment through a level or slice range got a new view at every draw, retired after the submission. A mip-chain pass does so at every level of every frame.
+- **Fix:** `fb_view` makes the same view and keeps it in the texture's [view cache](rendering.md#texture-views-cached-by-texture-and-view-parameters), its key marked (`pad[0] = 1`) so it never matches a registration's own view. The cache keeps 8 views per texture (`VC_WAYS`, 4 before), so a chain's per-level views do not evict the registrations'. These views live until the texture is released, as the cache's others do.
+- **Found on:** [Donkey Kong Bananza](../../dm/games/040074A01BF12000/README.md#found-on-this-game): its bloom and environment chains, about 1 % of the replay thread in view creation (a Metal System Trace's time profile of the replay thread before these changes).
 
 ### Late frames with an idle GPU stepped the hold up and unpaced holds did not probe
 

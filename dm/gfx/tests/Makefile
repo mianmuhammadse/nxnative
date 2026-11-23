@@ -146,6 +146,12 @@ t_tbuf_live: t_tbuf_live.m $(MTL_T_DEP)
 check_t_tbuf_live: t_tbuf_live
 	MTL_DEBUG_LAYER=1 DM_NVN_ENC_THREAD=0 ./t_tbuf_live
 	MTL_DEBUG_LAYER=1 DM_NVN_ENC_THREAD=1 ./t_tbuf_live
+t_img_pool: t_img_pool.m $(MTL_T_DEP)
+	clang $(CFLAGS) -fobjc-arc -o $@ t_img_pool.m $(filter-out ../nvn/hle_nvn.c,$(MTL_T_SRC)) $(FW)
+.PHONY: check_t_img_pool
+check_t_img_pool: t_img_pool
+	MTL_DEBUG_LAYER=1 DM_NVN_ENC_THREAD=0 ./t_img_pool
+	MTL_DEBUG_LAYER=1 DM_NVN_ENC_THREAD=1 ./t_img_pool
 .PHONY: check_t_tbuf_access
 check_t_tbuf_access: t_tbuf_access
 	MTL_DEBUG_LAYER=1 DM_NVN_ENC_THREAD=0 ./t_tbuf_access shadow
@@ -275,6 +281,12 @@ check_t_tex_fit_root: t_tex_fit_root
 	MTL_DEBUG_LAYER=1 ./t_tex_fit_root
 t_addr_known: t_addr_known.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_addr_known.m $(filter-out ../nvn/hle_nvn.c,$(MTL_T_SRC)) $(FW)
+# The address → pool cache's region table (pc_get / pc_put): another page of a region already seen, a pool's bounds, and no entry kept across a change of the pools
+t_pool_region: t_pool_region.m $(MTL_T_DEP)
+	clang $(CFLAGS) -fobjc-arc -o $@ t_pool_region.m $(MTL_T_SRC) $(FW)
+# The per-draw walks' binding lists (sh_lists_make): every kind the walks act on, in rf.b's order
+t_binding_lists: t_binding_lists.m $(MTL_T_DEP)
+	clang $(CFLAGS) -fobjc-arc -o $@ t_binding_lists.m $(MTL_T_SRC) $(FW)
 t_file_wire: t_file_wire.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_file_wire.m $(MTL_T_SRC) $(FW)
 t_gpu_only_addr: t_gpu_only_addr.m $(MTL_T_DEP)
@@ -522,6 +534,7 @@ t_pso_archive: t_pso_archive.m $(MTL_T_DEP) ../../host/hle_lifecycle.c
 check_t_pso_archive: t_pso_archive
 	MTL_DEBUG_LAYER=1 ./t_pso_archive
 	MTL_DEBUG_LAYER=1 ./t_pso_archive --active-flush
+	MTL_DEBUG_LAYER=1 ./t_pso_archive --adopt-prebuilt
 	MTL_DEBUG_LAYER=1 python3 test_pso_archive.py "$(CURDIR)/t_pso_archive"
 t_pso_bundle: t_pso_bundle.m ../tools/pso_offline.py $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_pso_bundle.m $(MTL_T_SRC) $(FW)
@@ -845,6 +858,9 @@ check_t_vk_renderdragon: RUN_ENV = MTL_DEBUG_LAYER=1
 t_float_pad: t_float_pad.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_float_pad.m $(MTL_T_SRC) $(FW)
 check_t_float_pad: RUN_ENV = MTL_DEBUG_LAYER=1
+t_default_attrib: t_default_attrib.m $(MTL_T_DEP)
+	clang $(CFLAGS) -fobjc-arc -o $@ t_default_attrib.m $(MTL_T_SRC) $(FW)
+check_t_default_attrib: RUN_ENV = MTL_DEBUG_LAYER=1
 # Kept vertex conversions: kept from the second submission, equal to vconv_elem, dropped by a write to the source (game, host or GPU), left by a write beside it.
 t_vconv_keep: t_vconv_keep.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_vconv_keep.m $(MTL_T_SRC) $(FW)
@@ -996,3 +1012,10 @@ t_depth_bounds: t_depth_bounds.m $(MTL_T_DEP)
 check_t_depth_bounds: t_depth_bounds
 	MTL_DEBUG_LAYER=1 DM_NVN_ENC_THREAD=0 ./$<
 	MTL_DEBUG_LAYER=1 DM_NVN_ENC_THREAD=1 ./$<
+
+# Per-run misaligned sparse mappings, sparse alias visibility, >32 handle splits, BC+IMAGE sparse textures, geometry scratch reuse + trim
+t_sparse_shadow: t_sparse_shadow.m $(MTL_T_DEP)
+	clang $(CFLAGS) -fobjc-arc -o $@ t_sparse_shadow.m $(filter-out ../nvn/hle_nvn.c,$(MTL_T_SRC)) $(FW)
+.PHONY: check_t_sparse_shadow
+check_t_sparse_shadow: t_sparse_shadow
+	MTL_DEBUG_LAYER=1 ./t_sparse_shadow
