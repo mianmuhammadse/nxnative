@@ -1,7 +1,7 @@
 # nxnative
 
 > [!NOTE]
-> **This is the `no-bc` branch of a fork of [seedds/nxnative](https://github.com/seedds/nxnative).** It tracks upstream `main` (merged regularly) and adds the features below. Everything else in this README is upstream's, unchanged.
+> **This is `nxnative-nobc` (branch `no-bc`), a fork of [seedds/nxnative](https://github.com/seedds/nxnative).** It tracks upstream `main` (merged regularly) and adds the features below. Everything else in this README is upstream's, unchanged.
 >
 > **What this fork adds**
 > - **iPhone 15 and other GPUs without BC texture support (A16).** BC1, BC2 and BC3 textures are transcoded to ASTC 4x4 on the GPU at upload, a quarter of the memory of RGBA8; BC4, BC5, BC6H, BC7 and 3D textures are decompressed. Tested on Metroid Dread and Breath of the Wild on an iPhone 15. The Vulkan layer (`dm/gfx/vk/hle_vk.m`) stores BC images the same way, with the same `DM_NO_BC_ASTC` setting; tested on Until Then (Godot) on an iPhone 15, and logs `[vk] no BC: …` at its first BC image. OpenGL games have no conversion yet. `DM_NO_BC_ASTC=all|bc1|0` selects the path, and `DM_TEST_NO_BC=1` forces it on a Mac for testing ([details](dm/gfx/tex/README.md)).
