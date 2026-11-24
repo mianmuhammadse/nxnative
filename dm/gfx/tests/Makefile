@@ -108,6 +108,8 @@ t_nvn_rt_state: t_nvn_rt_state.m $(MTL_T_DEP)
 check_t_nvn_rt_state: RUN_ENV = MTL_DEBUG_LAYER=1
 t_rt_comp: t_rt_comp.c ../nvn/hle_nvn.c ../nvn/nvn_rt.h ../../host/crash.c ../../host/hle_bigstack.c t_host_stubs.c $(GFX) $(GFX_H)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_rt_comp.c ../../host/crash.c ../../host/hle_bigstack.c t_host_stubs.c $(GFX) $(FW)
+t_rt_stall: t_rt_stall.c ../nvn/hle_nvn.c ../nvn/nvn_rt.h ../../host/crash.c ../../host/hle_bigstack.c t_host_stubs.c $(GFX) $(GFX_H)
+	clang $(CFLAGS) -fobjc-arc -o $@ t_rt_stall.c ../../host/crash.c ../../host/hle_bigstack.c t_host_stubs.c $(GFX) $(FW)
 t_dirty_slots: t_dirty_slots.c ../nvn/nvn_dirty.c ../../host/crash.c ../nvn/nvn_dirty.h $(GAME_H)
 	clang $(CFLAGS) -o $@ t_dirty_slots.c ../../host/crash.c ../nvn/nvn_dirty.c
 t_dirty_race: t_dirty_race.c ../nvn/nvn_dirty.c ../../host/crash.c ../nvn/nvn_dirty.h $(GAME_H)
@@ -170,6 +172,8 @@ t_refl: t_refl.m ../nvn/nvn_refl.m ../nvn/nvn_refl.h
 	clang -O1 -g -Wall -I../nvn -fobjc-arc -o $@ t_refl.m ../nvn/nvn_refl.m -framework Metal -framework Foundation
 t_hmap: t_hmap.c ../nvn/nvn_hmap.h
 	clang -O1 -Wall -o $@ t_hmap.c
+t_aniso: t_aniso.c ../nvn/nvn_aniso.h
+	clang -O1 -Wall -Wextra -Werror -o $@ t_aniso.c
 t_pace: t_pace.c ../nvn/nvn_pace.h
 	clang -O1 -Wall -o $@ t_pace.c
 t_timestamp: t_timestamp.c ../nvn/nvn_timestamp.h
@@ -453,6 +457,9 @@ t_pend_index: t_pend_index.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -fsanitize=address,undefined -mllvm -asan-globals=0 -o $@ t_pend_index.m $(MTL_T_SRC) $(FW)
 t_bind_stages: t_bind_stages.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -fsanitize=address,undefined -mllvm -asan-globals=0 -o $@ t_bind_stages.m $(filter-out ../nvn/hle_nvn.c,$(MTL_T_SRC)) $(FW)
+# The keys of the shaders a library lacks, kept for the next --seen-shaders build (DM_NVN_MISSING_KEYS): CPU only
+t_missing_keys: t_missing_keys.m $(MTL_T_DEP)
+	clang $(CFLAGS) -fobjc-arc -fsanitize=address,undefined -mllvm -asan-globals=0 -o $@ t_missing_keys.m $(filter-out ../nvn/hle_nvn.c,$(MTL_T_SRC)) $(FW)
 t_direct_upload: t_direct_upload.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_direct_upload.m $(MTL_T_SRC) $(FW)
 .PHONY: check_t_direct_upload
@@ -535,6 +542,7 @@ check_t_pso_archive: t_pso_archive
 	MTL_DEBUG_LAYER=1 ./t_pso_archive
 	MTL_DEBUG_LAYER=1 ./t_pso_archive --active-flush
 	MTL_DEBUG_LAYER=1 ./t_pso_archive --adopt-prebuilt
+	MTL_DEBUG_LAYER=1 ./t_pso_archive --bundle-recovery
 	MTL_DEBUG_LAYER=1 python3 test_pso_archive.py "$(CURDIR)/t_pso_archive"
 t_pso_bundle: t_pso_bundle.m ../tools/pso_offline.py $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_pso_bundle.m $(MTL_T_SRC) $(FW)
@@ -750,6 +758,12 @@ check_t_storage_pair: t_storage_pair
 	DM_NVN_RT_RECYCLE=0 MTL_DEBUG_LAYER=1 ./t_storage_pair
 	DM_NVN_STORAGE_ALIAS=0 MTL_DEBUG_LAYER=1 ./t_storage_pair
 # A game's upscaler drawn by MetalFX (any profile; the profile's upscaler shaders, from its shader map, when it has some); with and without the switch, and on the encoding thread
+t_mfx_evict: t_mfx_evict.m $(MTL_T_DEP)
+	clang $(CFLAGS) -fobjc-arc -o $@ t_mfx_evict.m $(MTL_T_SRC) $(FW)
+.PHONY: check_t_mfx_evict
+check_t_mfx_evict: t_mfx_evict
+	DM_NVN_ENC_THREAD=0 ./t_mfx_evict
+	DM_NVN_ENC_THREAD=1 ./t_mfx_evict
 t_upscaler_mfx: t_upscaler_mfx.m t_mfx_passes.h $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_upscaler_mfx.m $(MTL_T_SRC) $(FW)
 .PHONY: check_t_upscaler_mfx
@@ -1028,3 +1042,11 @@ t_treg_meta: t_treg_meta.m $(MTL_T_DEP)
 .PHONY: check_t_treg_meta
 check_t_treg_meta: t_treg_meta
 	MTL_DEBUG_LAYER=1 ./t_treg_meta
+
+# Pool-table copy-on-write, cross-submission POOL_SUB_MS validation, and placed-texture res_check (Refs #1810)
+t_pool_cow_residency: t_pool_cow_residency.m $(MTL_T_DEP)
+	clang $(CFLAGS) -fobjc-arc -o $@ t_pool_cow_residency.m ../../host/crash.c ../../host/hle_bigstack.c t_host_stubs.c $(filter-out ../nvn/nvn_mtl.m,$(GFX)) $(FW)
+.PHONY: check_t_pool_cow_residency
+check_t_pool_cow_residency: t_pool_cow_residency
+	MTL_DEBUG_LAYER=1 DM_NVN_ENC_THREAD=0 ./t_pool_cow_residency
+	MTL_DEBUG_LAYER=1 DM_NVN_ENC_THREAD=1 ./t_pool_cow_residency

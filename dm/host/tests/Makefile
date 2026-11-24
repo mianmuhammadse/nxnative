@@ -68,6 +68,7 @@ run: $(B)/t_phone_motion $(B)/t_mii $(B)/t_net_eventfd $(B)/t_language $(B)/t_mo
 	$(B)/t_movie_avc
 	$(B)/t_nv
 	$(B)/t_objmap
+	$(B)/t_stack_alloc
 	$(B)/t_vi_history $(QUIET)
 	$(B)/t_nfc
 	$(B)/t_motion
@@ -255,12 +256,16 @@ $(B)/t_uecvar: t_uecvar.c ../hle_uecvar.c ../hle.h ../dm.h $(GAME_H) | $(B)
 $(B)/t_swkbd: t_swkbd.c ../hle_swkbd.c ../hle.h ../dm.h $(GAME_H) | $(B)
 	$(CLANG) -O1 -Wno-unused-function -I.. $(GINC) -o $@ t_swkbd.c ../hle_swkbd.c
 run: $(B)/t_bigstack
-run: web-stack
-.PHONY: web-stack
+run: web-stack web-apple
+.PHONY: web-stack web-apple
 web-stack: $(B)/t_web_stack
 	$(B)/t_web_stack
 $(B)/t_web_stack: t_web_stack.c ../hle_web.c ../hle_bigstack.c ../hle.h ../dm.h ../front.h ../dm_input.h $(GAME_H) | $(B)
 	$(CLANG) -O1 -g -Wall -Werror -Wno-unused-function -I.. $(GINC) -o $@ t_web_stack.c ../hle_bigstack.c
+web-apple: $(B)/t_web_apple
+	$(B)/t_web_apple
+$(B)/t_web_apple: t_web_apple.m ../web_apple.m ../dm.h ../dm_input.h ../front.h $(GAME_H) | $(B)
+	$(CLANG) -O1 -g -fobjc-arc -Wall -Werror -Wno-unused-function -I.. $(GINC) -o $@ t_web_apple.m -framework Cocoa -framework WebKit -framework JavaScriptCore
 $(B)/t_bigstack: t_bigstack.c ../hle_bigstack.c ../hle.h ../dm.h $(GAME_H) | $(B)
 	$(CLANG) -O1 -Wall -Wno-unused-function -I.. $(GINC) -o $@ t_bigstack.c ../hle_bigstack.c
 run: watch-sample
@@ -300,6 +305,9 @@ $(B)/t_nv: t_nv.c ../../gfx/hle_nv.c ../hle.h ../dm.h $(GAME_H) | $(B)
 run: $(B)/t_objmap
 $(B)/t_objmap: t_objmap.c ../hle_os.c ../hle.h ../dm.h $(GAME_H) | $(B)
 	$(CLANG) -O1 -g -Wall -Werror -Wno-unused-function -I.. $(GINC) -o $@ t_objmap.c
+run: $(B)/t_stack_alloc
+$(B)/t_stack_alloc: t_stack_alloc.c ../hle_stack_alloc.c ../hle_bigstack.c ../hle.h ../dm.h $(GAME_H) | $(B)
+	$(CLANG) -O1 -g -Wall -Werror -Wno-unused-function -I.. $(GINC) -o $@ t_stack_alloc.c ../hle_bigstack.c
 # nn::nfc answered without nfc:user (NFC disabled), beside the nfp no-tag answers
 run: $(B)/t_nfc
 $(B)/t_nfc: t_nfc.c ../hle_sdk16.c ../hle.h ../dm.h $(GAME_H) | $(B)
@@ -369,6 +377,18 @@ $(B)/t_pollwait: t_pollwait.c t_condvar_stub.c ../hle_thread.c ../dm.h $(GAME_H)
 	$(CLANG) -O1 -g -Wall -Werror -Wno-unused-function -I.. $(GINC) -o $@ t_pollwait.c t_condvar_stub.c
 $(B)/t_clockwait: t_clockwait.c t_condvar_stub.c ../hle_thread.c ../dm.h $(GAME_H) | $(B)
 	$(CLANG) -O1 -g -Wall -Werror -Wno-unused-function -I.. $(GINC) -o $@ t_clockwait.c t_condvar_stub.c
+$(B)/t_scheduler_config: t_scheduler_config.c t_condvar_stub.c ../hle_thread.c ../dm.h $(GAME_H) | $(B)
+	$(CLANG) -O1 -g -Wall -Werror -Wno-unused-function -I.. $(GINC) -o $@ t_scheduler_config.c t_condvar_stub.c
+.PHONY: scheduler-config scheduler-config-tsan
+scheduler-config: $(B)/t_scheduler_config
+	$(B)/t_scheduler_config default
+	$(B)/t_scheduler_config custom
+	$(B)/t_scheduler_config off
+	$(B)/t_scheduler_config empty
+scheduler-config-tsan:
+	$(MAKE) B=$(B)/scheduler-tsan SAN="$(TSAN_FLAGS)" scheduler-config
+run: scheduler-config
+tsan-threads-run: scheduler-config
 $(B)/t_preempt: t_preempt.c t_condvar_stub.c ../hle_thread.c ../dm.h $(GAME_H) | $(B)
 	$(CLANG) -O1 -g -Wall -Werror -Wno-unused-function -I.. $(GINC) -o $@ t_preempt.c t_condvar_stub.c
 # the pause tests supply module_of (the stub's reports no guest code) through DM_TEST_MODULE_OF
@@ -495,7 +515,7 @@ include ../../sanitizers/sanitizers.mk
 asan:
 	@$(call san_fresh,$(B)/asan,$(ASAN_FLAGS))
 	$(ASAN_ENV) $(MAKE) B=$(B)/asan SAN="$(ASAN_FLAGS)" run
-TSAN_T = t_audio t_audio_stats t_audio_device t_thread_leak t_oe t_fs_commit_list t_fs_case t_save_sync t_condvar t_condvar_old t_preempt t_system_event t_notify_sched t_handoff_wait t_altstack t_sync_wait
+TSAN_T = t_audio t_audio_stats t_audio_device t_thread_leak t_oe t_fs_commit_list t_fs_case t_save_sync t_condvar t_condvar_old t_preempt t_system_event t_notify_sched t_handoff_wait t_altstack t_sync_wait t_ue_heap_span
 TSAN_T += t_net_eventfd t_net_loopback t_account
 tsan-threads:
 	@$(call san_fresh,$(B)/tsan,$(TSAN_FLAGS))
@@ -523,6 +543,7 @@ tsan-threads-run: $(addprefix $(B)/,$(TSAN_T))
 	$(B)/t_handoff_wait --all-peers
 	$(B)/t_altstack
 	$(B)/t_sync_wait
+	$(B)/t_ue_heap_span
 	DM_QOS_MAP=1 $(B)/t_notify_sched
 	DM_QOS_MAP=1 $(B)/t_notify_sched --all-peers
 $(B)/t_pad_hid: t_pad_hid.c ../pad_hid.h ../dm_input.h | $(B)

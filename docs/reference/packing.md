@@ -17,6 +17,13 @@
 - **Found on:** [Diablo II: Resurrected](../../dm/games/0100726014352000/README.md), whose separate licence-only DLC package was truncated ([issue #2013](https://github.com/seedds/nxnative/issues/2013)). Main now has the shared [CASC/SHAD reader](shaders.md#blizzards-casc-storage-and-shad-containers); that separate shader-discovery fix does not repair missing package bytes. The reported base game alone (v0) remains unchecked, as the game note records.
 - **Check:** `dm/tools/tests/test_pfs0_storage.py` exercises synthetic payload truncation, out-of-range and overflowing spans, an empty file at EOF, and the CLI's damaged-input exit with and without `--allow-damaged`, with both normal and missing-final-NUL name tables.
 
+### DLC extraction rejects an archived filename
+
+- **Symptom:** `nx_extract --aoc --romfs-image` stops with `ResultFsInvalidCharacter (2002-6004)` after selecting the add-on's data NCA.
+- **Cause:** LibHac 0.19 enumerates a RomFS directory named `D:`, then rejects the colon when the string-based file-open overload validates the full path.
+- **Fix:** for this result on a LibHac RomFS, the image writer uses the path it got from archive enumeration with LibHac's typed file-open overload. Reads still go through the NCA's integrity-checked storage. The image preserves the original bytes and name.
+- **Found on:** [CAPTAIN TSUBASA 2: WORLD FIGHTERS](../../dm/games/01009720213B0000/README.md), all five supplied DLCs. `test_romfs_read.py` also exercises a synthetic archive with a literal `D:` directory.
+
 ### PFS0 file-name table missing its final NUL
 
 - **Symptom:** package identification stops with `ValueError: subsection not found` in `pfs0_names`, or LibHac reports `ResultFsPathNotFound` opening the last file of an NSP.
@@ -265,6 +272,14 @@
 - **Fix:** the fast key also records the inode and change time, as the image reader does (`romfs._resolve`), and its format is version 2. A changed identity goes through `archive_key`, which hashes the libraries' bytes; an unchanged image still takes the fast path.
 - **Found on:** no game; reproduced with synthetic libraries during the review of PR #2820. `test_pso_offline.Build.test_a_changed_image_with_preserved_size_and_mtime_is_read_again` changes used metallib bytes inside a valid image, restores its modification time, and checks that the compiler is called again before subsequent unchanged runs are reused.
 
+### A missing shader's key was lost after two more starts
+
+- **Symptom:** a `--seen-shaders` build does not add a shader the game reported missing (`[RED] shader <key> (<stage>) failed to load`, or `failed to load shader <key>_b`) in a session before the last two starts of the app: the area still draws without it after the rebuild.
+- **Cause:** the only record of the key was the log. `dm/mac/launcher.c` renames `<title ID>.log` to `.prev.log` at every start, also one that only opens the settings window and quits, and `seen_logs` reads those two files, so the third start from the session onward dropped its keys. The `--platform mac` run command's `tee` starts `run/host.log` again on each run, which keeps one session.
+- **Fix:** general, for every NVN game on the Mac. The host writes the key when it misses the shader: `shader_missing_note` (`nvn_mtl.m`), at the two red lines, appends it to the file `DM_NVN_MISSING_KEYS` names. The launcher sets that to `shader_missing.txt` beside the save; the partial run command to `run/shader_missing.txt`, after its pipeline prebuild, whose loads are not what the game asked for. `seen_lists` / `seen_keys` read both files and never write them. A launch does no work: no log is searched. Each key is written once across runs, so the file stops at 17 bytes per distinct key the game ever missed (2.2 MB for the 131,426 keys of the largest map listed in [Building selected Mac shaders](../development.md#building-selected-mac-shaders)). A key that later loads stays in the file and is only built again, as `partial-keys.txt` already does; a key of another game version is dropped by the shader map filter and stays for that version's build folder; a chain change keeps them, as a key names the guest shader. A line a stopped host left half written is not read as a key, and the next key starts on a new line. Only `<key>` and `<key>_b`: the geometry routes' libraries (`_bg<n>`, `_bgv`, `_bl<n>`) and `rt_library_b` are not keys of the map.
+- **Check:** `dm/gfx/tests/t_missing_keys.m` (the real `shader_load` and `prog_get` on an empty library: both red lines, once per key across runs and four threads, the routes, a half line, unset); `dm/tools/tests/test_nsp_mac_app.py` `test_missing_shader_outlives_the_logs` (the packed launcher over three starts, with a stand-in host), `test_keys_from_the_hosts_lists`, `test_prebuild_keeps_no_missing_keys`.
+- **Found on:** reported in [GitHub issue #1519](https://github.com/seedds/nxnative/issues/1519), from two `--seen-shaders` sessions that asked for 2,614 keys their partial library lacked. Shown with the packed launcher, the host's loader and synthetic tests; not run on a game.
+
 ### The free-space check stops a build on a Mac that has the space
 
 - **Symptom:** the NSP script stops with `[RED] less than N GB free on the volume of <build folder>` before extraction (or `less than 5 GB free` before the IPA), while Finder and the Storage settings show far more available. The Mac app step can stop with `the app needs … GB on the volume of …`, and `pso_offline.py` with `GB free on the volume of …, metal-tt needs about …` or `GB free before merging`.
@@ -425,6 +440,14 @@
 - **Found on:** [Ocarina of Time](../../dm/games/0400486024DEC000/README.md#found-on-this-game).
 - **Check:** `test_shader_cache.py` (`Generations`: copying on read, newest generation first, other chains' shaders never hit, dropping older files with the other target kept, a folder as the read-only cache), `test_nsp_mac.py` (`test_older_compile_caches_go_with_a_build`).
 
+### A partial Mac build creates a database at the cache directory path
+
+- **Symptom:** a fresh `--seen-shaders` build succeeds. A later full build stops with `NotADirectoryError` while removing `shader/cache/b-<chain>.img`.
+- **Cause:** the packer passes `shader/cache` as `DMSH_CAS` on partial builds. When that path is absent, `dmsh_build.py` interprets it as the name of a SQLite file.
+- **Fix:** `build_shaders` creates the cache directory before calling the compiler. For an existing misplaced database, it folds in the SQLite write-ahead log and moves the file to `shader/cache/cas.db`, where the compiler can reuse its Metal compilations.
+- **Found on:** [Mortal Kombat 11](../../dm/games/0100F2200C984000/README.md), switching from its first partial Mac build to a full one. The bug can affect any fresh NVN partial build.
+- **Check:** `test_nsp_mac_app.py` (`SeenShaders`) checks the directory before a partial compile and retrieves a saved Metal compile after the full build recovers a misplaced database.
+
 ### A new compile cache on an exFAT drive is "a readonly database"
 
 - **Symptom:** the first build of a game whose build folder is on an exFAT drive stops at its shader step, before any shader is compiled: `dmsh_build.py` fails opening `shader/cache/cas.db` with `sqlite3.OperationalError: attempt to write a readonly database` at `PRAGMA journal_mode=WAL` in `shader_cache.Store._open`, and the step ends with `[RED] own_compilers.py exit code 1`. Running the build again goes past it, as the failed run has left the file 16 KB long.
@@ -530,6 +553,13 @@
 - **Cause:** a program's build runs with its own title ID, the application's plus N, and `extract_aoc` numbered each DLC from that title ID (`index = title ID − title ID of the build − 0x1000`). A DLC belongs to the application and the game asks for it by its index from the application, so every image of program N was N below its index: the application's DLC 1 became `0.img`, which no game asks for, and the game's DLC 1 was the application's DLC 2.
 - **Fix:** `extract_aoc` numbers from the application's title ID (the build's with its low three hex digits cleared, as a base game's ends in `000`), and a program's DLC extraction key carries that change, so an `aoc/` numbered the old way is extracted again. `test_a_programs_dlc_are_the_applications` in `test_nsp_scan.py` checks the names.
 - **Found on:** METAL GEAR SOLID: Peace Walker - Master Collection Version (`0100C6F01C4F8000`, 1.3.1), whose launcher starts the game in program 1 (`0100C6F01C4F8001`): with the Multilingual Pack (`…9001`) and the Pre-Order Bonus (`…9002`), program 1 mounted the Pre-Order Bonus where it asked for the Multilingual Pack and ended at start; numbered from the application, it mounts `1.img` with the pack's 273 entries and gets past its start.
+
+### Decoder-backed archives stored only in DLC are skipped at the shader split
+
+- **Symptom:** the shader split prints `[RED] N file(s) could not be read, their shaders are left out` with `Oodle- or LZ5-compressed game files: set DM_OODLE_HOST ...` in `shader_split.log`, and splits only shaders embedded in `main` (e.g., 189 / 193 instead of ~58,700) when the program's own RomFS holds no decoder-backed archives and its `.forge` or other Oodle/LZ5 archives live in DLC.
+- **Cause:** `build_ipa_from_nsp.py` computed `src = build_sources(...)` from the packed program's own RomFS only and set `DM_OODLE_HOST` / `DM_OODLE_MODULES` only from `src['oodle_packs'][0] or src['ue_legacy'][0]`, even though `split_shaders` passes `dlc_roms` to `shader_split.py`, which dispatches every Oodle/LZ5 archive reader over DLC roots too.
+- **Fix:** `profile_guess.py` factors its RomFS decoder-archive scanner into `decoder_archives` / `decoder_sources` (using `romfs.os.walk` and `romfs.open`, so both `.img`- and directory-backed roots are scanned for all Oodle/LZ5 archive formats, excluding LZO1X Scimitar v27 `.forge`). When an NVN program's own RomFS does not already trigger the Oodle host and `dlc_roms` is non-empty, `build_ipa_from_nsp.py` runs `dlc_decoder_sources` (cached in `work/aoc.sources` for image-only DLC) and enables `DM_OODLE_HOST` / `DM_OODLE_MODULES` if any DLC root needs it.
+- **Found on:** Assassin's Creed: The Ezio Collection (`0100670014482000`, update 1.3, M4 Pro; [PR #1403](https://github.com/seedds/nxnative/pull/1403)): Brotherhood and Revelations keep all 105 `.forge` archives in DLC while their own RomFS holds only a placeholder, splitting 189 / 193 shaders before vs ~58,700 each after. Synthetic tests in `test_profile_guess.py` and `test_nsp_incremental.py` cover image- and directory-backed DLC, Oodle vs LZO1X `.forge`, other Oodle formats, caching, and the `main()` Oodle-host predicate.
 
 ## Launcher metadata
 
@@ -777,9 +807,16 @@
 
 - **Symptom:** for a title ID with no profile, the newest update extracts successfully during `build ID lookup`, but the subsequent base-only probe fails its ExeFS hash check and stops the survey, even though the update supplies the code.
 - **Cause:** `same_build` tries the newest update's main build ID, then the base game's as a second guess. Both used the same fatal extraction call, making the optional base-only probe a required input. This lookup error is independent of why that base cannot be read; the reported base hash failure has not been diagnosed as damage or a sparse NCA.
-- **Fix:** `scripts/build_ipa_from_nsp.py` `same_build` catches `BuildError` only on the base-only probe after the newest update's extraction succeeded. It logs `[RED] the base game alone could not be read for the build ID lookup; the update supplies the code, so the survey goes on`, deletes the partial output and continues without an alias match. A failed update extraction, a failed base-only extraction when there is no update, and other exceptions still propagate. The extractor requires a matching update Program NCA and reads its complete ExeFS with integrity checks; its accepted sparse-base exit code 4 cannot occur with an update Program NCA. The survey and build's actual extractions remain strict. This is a general lookup rule, separate from [recognizing a sparse base](#the-surveys-build-id-lookup-stops-on-the-base-game-alone-with-a-hash-error); it does not disable integrity checks or repair the unreadable base.
+- **Fix:** `scripts/build_ipa_from_nsp.py` `same_build` catches `BuildError` only on the base-only probe after the newest update's extraction succeeded. It logs `[RED] the base game alone could not be read for the build ID lookup; the update supplies the code, so the survey goes on`, deletes the partial output and continues without an alias match. A failed update extraction, unexpected errors from the base probe when there is no update, and other exceptions still propagate. Exit code 4 is accepted only for a base-only probe with no readable main. The survey and build's actual extractions remain strict. See also [recognizing a sparse base](#the-surveys-build-id-lookup-stops-on-the-base-game-alone-with-a-hash-error).
 - **Found on:** [Pokémon Violet](../../dm/games/01008F6008C5E000/README.md#files-and-shaders) ([PR #2701](https://github.com/seedds/nxnative/pull/2701)).
 - **Check:** `dm/tools/tests/test_nsp_alias.py` covers continuation after an unreadable optional base and preservation of the required base-only failure.
+
+### A program introduced by an NSP update has no base NCA
+
+- **Symptom:** selecting the new program with `--program` stops at `no Program NCA … in the base NSP`. Reading its update Program NCA directly opens the ExeFS but fails on the RomFS.
+- **Cause:** the program ships only in the update. Its RomFS uses BKTR, and all 6,237 relocations select the update's own storage. LibHac applies the relocation map through its patch-overlay API.
+- **Fix:** `nx_extract` accepts an explicitly selected program supplied by the update. For a BKTR section it checks every relocation before using the update as both inputs to LibHac's overlay. A relocation into base storage still requires the matching base NCA. ExeFS and RomFS extraction keep their integrity checks.
+- **Found on:** [XCOM 2 Collection](../../dm/games/0100D0B00FB74000/README.md) `v131072`, whose War of the Chosen program extracted all 5,317 RomFS files with strict integrity checks.
 
 ## Sparse base games
 
