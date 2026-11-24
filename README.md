@@ -5,23 +5,24 @@
 >
 > Bugs in this fork: [open an issue](https://github.com/mianmuhammadse/nxnative-nobc/issues) and attach the app's `Documents/log.txt`. Do not attach game files or keys.
 >
-> <details>
-> <summary><b>What this fork adds</b> (click to expand)</summary>
->
+> **What this fork adds**
 > - **iPhone 15 and other GPUs without BC texture support (A16).** BC1, BC2 and BC3 textures are transcoded to ASTC 4x4 on the GPU at upload, a quarter of the memory of RGBA8; BC4, BC5, BC6H, BC7 and 3D textures are decompressed. Tested on Metroid Dread and Breath of the Wild on an iPhone 15. The Vulkan layer (`dm/gfx/vk/hle_vk.m`) stores BC images the same way, with the same `DM_NO_BC_ASTC` setting; tested on Until Then (Godot) on an iPhone 15, and logs `[vk] no BC: …` at its first BC image. OpenGL games have no conversion yet. `DM_NO_BC_ASTC=all|bc1|0` selects the path, and `DM_TEST_NO_BC=1` forces it on a Mac for testing ([details](dm/gfx/tex/README.md)).
 > - **Memory-pressure response on iOS.** Caches are trimmed on a system memory warning, a memory-pressure event or low headroom, and the memory log line counts pipelines, shaders, textures by format and unreferenced shared textures.
 > - **Frame rate Auto / 30 as a launcher setting** for games that step by elapsed time (Metroid Dread), `DM_FPS`.
 > - **Phone motion.** The iPhone's gyro and attitude (CoreMotion) drive the controller's motion, with a hold of L3 + R3 for one second to recenter. `DM_MOTION_FLIP` fixes the axes. Shaking the phone shakes the controller.
 >
 > Not every upstream game has been run on the A16: check each game's note for what was tested. Upstream's requirements below say A17 Pro or later; on this fork the games named in the Requirements section also run on an iPhone 15.
->
-> </details>
+
+<details>
+<summary><b>About nxnative</b> (upstream's introduction; click to expand)</summary>
 
 Play your own Nintendo Switch and Switch 2 games natively on Apple silicon Macs, iPhone and iPad. One script packs your game into a Mac app or an unsigned IPA that you sideload.
 
 It is not an emulator: the game's own code runs directly on the Apple chip, with Switch graphics rebuilt on Metal. Nothing from any game is in this repository, and the project is not affiliated with Nintendo or any game publisher.
 
 [Games](#games) · [Community front ends](#community-front-ends) · [Requirements](#requirements) · [How to play](#how-to-play) · [Discussions](#discussions) · [For developers](#for-developers)
+
+</details>
 
 ## Games
 
