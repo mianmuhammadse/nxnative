@@ -4,7 +4,7 @@
 > **This is the `no-bc` branch of a fork of [seedds/nxnative](https://github.com/seedds/nxnative).** It tracks upstream `main` (merged regularly) and adds the features below. Everything else in this README is upstream's, unchanged.
 >
 > **What this fork adds**
-> - **iPhone 15 and other GPUs without BC texture support (A16).** BC1, BC2 and BC3 textures are transcoded to ASTC 4x4 on the GPU at upload, a quarter of the memory of RGBA8; BC4, BC5, BC6H, BC7 and 3D textures are decompressed. Tested on Metroid Dread and Breath of the Wild on an iPhone 15. `DM_NO_BC_ASTC=all|bc1|0` selects the path, and `DM_TEST_NO_BC=1` forces it on a Mac for testing ([details](dm/gfx/tex/README.md)).
+> - **iPhone 15 and other GPUs without BC texture support (A16).** BC1, BC2 and BC3 textures are transcoded to ASTC 4x4 on the GPU at upload, a quarter of the memory of RGBA8; BC4, BC5, BC6H, BC7 and 3D textures are decompressed. Tested on Metroid Dread and Breath of the Wild on an iPhone 15. The Vulkan layer (`dm/gfx/vk/hle_vk.m`) stores BC images the same way, with the same `DM_NO_BC_ASTC` setting; tested on Until Then (Godot) on an iPhone 15, and logs `[vk] no BC: …` at its first BC image. OpenGL games have no conversion yet. `DM_NO_BC_ASTC=all|bc1|0` selects the path, and `DM_TEST_NO_BC=1` forces it on a Mac for testing ([details](dm/gfx/tex/README.md)).
 > - **Memory-pressure response on iOS.** Caches are trimmed on a system memory warning, a memory-pressure event or low headroom, and the memory log line counts pipelines, shaders, textures by format and unreferenced shared textures.
 > - **Frame rate Auto / 30 as a launcher setting** for games that step by elapsed time (Metroid Dread), `DM_FPS`.
 > - **Phone motion.** The iPhone's gyro and attitude (CoreMotion) drive the controller's motion, with a hold of L3 + R3 for one second to recenter. `DM_MOTION_FLIP` fixes the axes. Shaking the phone shakes the controller.
@@ -55,7 +55,7 @@ Community projects build on nxnative with tools to turn your games into apps for
 ## Requirements
 
 - **Mac:** Apple silicon, macOS 26.6 or later. Building games requires Xcode 27.2.
-- **iPhone:** A17 Pro chip or later, with iOS 26 or later. This fork also runs tested NVN games (Metroid Dread and Breath of the Wild) on the non-Pro iPhone 15 (A16), converting BC textures at runtime; Breath of the Wild needs the Increased Memory Limit entitlement. Vulkan and OpenGL games still require a GPU with BC support.
+- **iPhone:** A17 Pro chip or later, with iOS 26 or later. This fork also runs tested NVN games (Metroid Dread and Breath of the Wild) on the non-Pro iPhone 15 (A16), converting BC textures at runtime; Breath of the Wild needs the Increased Memory Limit entitlement. Vulkan games convert BC images the same way (Until Then, a Godot game, is the one tested on an iPhone 15; other Vulkan games have not been run on the A16). OpenGL games still require a GPU with BC support.
 - **iPad:** M1 chip or later, with iPadOS 26 or later.
 
 The games' textures are BC-compressed, which older iPhones cannot read. Switch 2 builds are tested on the Mac; check each game's note for device-specific validation.
