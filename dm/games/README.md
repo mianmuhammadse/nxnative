@@ -97,6 +97,7 @@ One row per profile; the notes are each profile's `README.md`. Entries marked pr
 | [Diablo III: Eternal Collection](01001B300B9BE000/README.md) | `01001B300B9BE000` | 2.7.7.92380 | 8.2.0 | Blizzard's engine, FMOD | NVN | — |
 | [Digimon Story Cyber Sleuth: Complete Edition](010014E00DB56000/README.md) | `010014E00DB56000` | 1.0.3 | 6.4.0 | Media.Vision MVGL | OpenGL | — |
 | [Digimon Story Time Stranger](010062E01FE0C000/README.md) | `010062E01FE0C000` | 1.2.2 | 20.5.21 | Media.Vision MVGL | NVN | — |
+| [Dispatch](01008BA02525A000/README.md) | `01008BA02525A000` | 1.0.17878 | 20.5.15 | Unreal Engine, FMOD | NVN | — |
 | [Divinity: Original Sin 2 - Definitive Edition](010027400CDC6000/README.md) | `010027400CDC6000` | 1.0.12 | 9.3.0 | Larian's engine, Wwise | NVN | 60 fps target |
 | [Donkey Kong Bananza](040074A01BF12000/README.md) | `040074A01BF12000` | v458752 (Switch 2) | 20.5.19 (Ounce) | Nintendo EPD (sead / agl / gsys) | NVN2 | — |
 | [Splatoon Raiders](0400380020056000/README.md) | `0400380020056000` | v65536 (Switch 2) | 21.4.4 (Ounce) | Nintendo EPD (sead / agl / gsys) | NVN2 | — |

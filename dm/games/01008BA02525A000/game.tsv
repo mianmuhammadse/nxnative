@@ -1,0 +1,43 @@
+# Dispatch (SDK 20): the survey's provisional values, kept as generated; the Mac boot and play session needed no change (dm/games/01008BA02525A000/README.md)
+
+# ---- Identity ----
+title_id	01008BA02525A000
+program_id	01008BA02525A000
+
+# ---- App ----
+name	Dispatch
+ipa	Dispatch.ipa
+app_category	public.app-category.games
+
+# ---- Versions ----
+build	v589824	1.0.17878	main=f4e9d6e14f1c3360ba4769ef8f81f266	subsdk0=3904a8dee6801472d56bd4921378df27	sdk=190030518b5d64e5d87b84bc54661af9
+package	v589824
+shader_versions	v589824
+
+# ---- Files ----
+# every module main imports from
+modules	main subsdk0 sdk
+romfs_marker	Dispatch/Content/Paks/pakchunk17-Switch.pak
+zip_store	.bank:.pak:.ttf:.metallib
+
+# ---- Memory ----
+# the NPDM declares 80 MB of system resource (virtual address memory) and main sets a heap: a 5 GB block with a large alias region; the heap check sizes the heap region from the heap the game asks for
+mem_reserve	0x140000000
+mem_alias	0x118000000
+mem_stack	0x10000000
+app_pool	0xCD500000
+# the NPDM declares 80 MB of system resource
+sys_resource	0x5000000
+
+# ---- Shader split ----
+# the decoded shader code archives: the engine's global shaders and the game's material shaders
+shader_groups	ShaderArchive-Global-=global ShaderArchive-=game
+shader_note	Dispatch shaders
+
+# heap check: 2026-11-25, heap 0.01 GB
+
+# ---- Address region check ----
+# the game calls nvnDeviceSetDepthMode with near = 0 in the check boot: the pipeline bases made before it runs are made for that mode
+depth_mode	zero
+
+# address regions: 2026-11-25, in its first 15 s in nnMain the game's regions reach alias +62.06 GB, within this Mac-only build's 64.00 GB alias region (what it takes later in play is not measured here; past the profile's 4.38 GB iPhone layout; a build for an iPhone checks again) (rewrite 322c86807581, Mac only)
