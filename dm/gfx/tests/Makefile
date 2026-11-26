@@ -444,6 +444,12 @@ check_t_cpu_storage: RUN_ENV = MTL_DEBUG_LAYER=1
 t_initial_uncached: t_initial_uncached.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_initial_uncached.m $(MTL_T_SRC) $(FW)
 check_t_initial_uncached: RUN_ENV = MTL_DEBUG_LAYER=1
+t_stale_float: t_stale_float.m $(MTL_T_DEP)
+	clang $(CFLAGS) -fobjc-arc -o $@ t_stale_float.m $(MTL_T_SRC) $(FW)
+.PHONY: check_t_stale_float
+check_t_stale_float: t_stale_float
+	MTL_DEBUG_LAYER=1 ./t_stale_float
+	DM_NVN_STALE_FLOAT=1 MTL_DEBUG_LAYER=1 ./t_stale_float
 t_upload_idle: t_upload_idle.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_upload_idle.m $(MTL_T_SRC) $(FW)
 .PHONY: check_t_upload_idle
@@ -913,11 +919,11 @@ t_blend_zero: t_blend_zero.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_blend_zero.m $(MTL_T_SRC) $(FW)
 check_t_blend_zero: t_blend_zero
 	@set -e; work=$$(mktemp -d); trap 'rm -rf "$$work"' EXIT; python3 test_dmsh_blend_zero.py --fixture "$$work"; MTL_DEBUG_LAYER=1 ./t_blend_zero "$$work"; DM_NVN_BLEND_ZERO=0 MTL_DEBUG_LAYER=1 ./t_blend_zero "$$work"
-# NVIDIA's rounding of a float colour into a normalized target through the replay (t_rop_round.m), with its shader from test_dmsh_blend_zero.py; then Apple's conversion as it is
+# NVIDIA's rounding of a float colour into normalized and 16-bit float targets through the replay (t_rop_round.m), with its shader from test_dmsh_blend_zero.py; probed, forced F16 shader guard, and Apple's conversion as it is
 t_rop_round: t_rop_round.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_rop_round.m $(MTL_T_SRC) $(FW)
 check_t_rop_round: t_rop_round
-	@set -e; work=$$(mktemp -d); trap 'rm -rf "$$work"' EXIT; python3 test_dmsh_blend_zero.py --fixture-rop "$$work"; MTL_DEBUG_LAYER=1 ./t_rop_round "$$work"; DM_NVN_ROP_ROUND=0 MTL_DEBUG_LAYER=1 ./t_rop_round "$$work"
+	@set -e; work=$$(mktemp -d); trap 'rm -rf "$$work"' EXIT; python3 test_dmsh_blend_zero.py --fixture-rop "$$work"; MTL_DEBUG_LAYER=1 ./t_rop_round "$$work"; DM_NVN_ROP_F16=1 MTL_DEBUG_LAYER=1 ./t_rop_round "$$work"; DM_NVN_ROP_ROUND=0 MTL_DEBUG_LAYER=1 ./t_rop_round "$$work"
 # Typed outputs through the pipeline path (t_typed_outputs.m), with its libraries from test_dmsh_typed.py, on the Metal 4 path and the MTLDevice's
 t_typed_outputs: t_typed_outputs.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_typed_outputs.m $(MTL_T_SRC) $(FW)
