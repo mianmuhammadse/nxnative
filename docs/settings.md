@@ -130,6 +130,10 @@ A controller's vibration weaker than this stays off, and the rest is spread over
 
 Off by default: each controller is a player as soon as it connects, in the order the system lists them. On: a controller becomes a player only when you press one of its buttons, as the lowest player free, so the players choose their order and how many play. That press also reaches the game. When a game asks for more players than have joined, a prompt over the game waits for the others to press a button; B closes it.
 
+### Switch 2 controllers
+
+**Off** by default. On, the game takes Joy-Con 2 and Pro Controller 2 over Bluetooth: hold the small Sync button on one during the game, until its player lights sweep, to pair it. On the Mac it pairs with this Mac, and after that a press of any of its buttons connects it ([Switch 2 controllers](playing.md#switch-2-controllers-mac)); macOS asks for Bluetooth access the first time, and again after the app is packed again. On iPhone and iPad it is used without pairing, so hold Sync again after each start of the game ([on iPhone and iPad](playing.md#switch-2-controllers-iphone-and-ipad)); iOS asks for Bluetooth access the first time. In an `env.txt`: `DM_SW2=1`.
+
 ## Performance
 
 These settings change how the app hands frames to the screen and how it prepares the GPU's work. The game's tested defaults are a good start; change them when a game stutters, runs hot, or you want less latency.
@@ -246,10 +250,6 @@ Turn off **Show this window at launch** to start the game at once with your choi
 
 **Window** or **Fullscreen**: how the game's window opens. ⌃⌘F or the green button changes it while you play. In an `env.txt`: `DM_FULLSCREEN=1` or `0`.
 
-### Switch 2 controllers
-
-**Off** by default. On, the game takes Joy-Con 2 and Pro Controller 2 over Bluetooth: hold the small Sync button on one during the game, until its player lights sweep, to pair it with this Mac; after that a press of any of its buttons connects it ([Switch 2 controllers](playing.md#switch-2-controllers-mac)). macOS asks for Bluetooth access the first time, and again after the app is packed again. In an `env.txt`: `DM_SW2=1`.
-
 ### Cloud saves folder
 
 **Choose a folder…** picks the iCloud Drive folder the game's save is synced through, the one the iPhone app chose in its launcher's **Cloud saves**, or the game's own folder inside it, named after its title ID ([Cloud saves](#cloud-saves)); **Turn off** stops it. Off by default. macOS may ask once whether the app may open iCloud Drive; if the game log says `this app may not open iCloud Drive`, allow it in System Settings › Privacy & Security › Files and Folders. In an `env.txt`: `DM_SAVE_SYNC=<folder>`, or `DM_SAVE_SYNC=icloud` for iCloud Drive › nxnative Saves; the window then shows it fixed.
@@ -273,6 +273,10 @@ Each time the game starts, with or without cloud saves, the save it starts from 
 On the iPhone and iPad the gear at the top centre of the touch controls opens a menu while the game runs; it stays when a controller hides the other controls. It holds **Console mode**, **Picture**, **Rotation** and the **Frame-rate counter**, then **Controller layout** (**2D**, **3D**, and **Tap**, no controls and every touch to the game, in handheld mode), **Touch feedback** and **Game rumble**: the settings that take effect at once. A choice opens to show its options, the current one ticked. The menu's text keeps one size whatever the system text size, so it stays short over the game. A change is remembered as on the settings screen, which shows it at the next start; a setting `Documents/env.txt` fixes is shown, not changed. The other settings need the game to start again, so they are only on the settings screen: close the app fully and open it again.
 
 Console mode changes as on a Switch put in or taken out of its dock. While a TV shows the game it stays **Docked**, and the mode you pick applies when the TV is disconnected. **Docked** removes the Tap layout, as a docked Switch reads no touch screen.
+
+## Prewarm contributions
+
+Apps packed with a contribution inbox show **Contribute prewarm lists automatically** in settings. It is on by default. Turn it off there or in the iPhone and iPad's in-game gear menu. When the game starts, and when the iPhone or iPad app becomes active again, the app checks the game's `pso_user.tsv` and sends a changed list with the game title ID and version to the nxnative inbox. The upload runs in the background, and maintainers review the lists before using them. [Prewarm lists](development.md#prewarm-lists)
 
 ## TV
 

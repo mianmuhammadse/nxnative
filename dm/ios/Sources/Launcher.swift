@@ -182,6 +182,9 @@ private struct LauncherView: View {
             }
             // The background save check reads the selected folder until it returns.
             CloudSavesSection(checking: checking)
+            if PrewarmUpload.available {
+                Section { PrewarmUploadSetting() }
+            }
             Section {
                 HStack {
                     Text("Memory available")
@@ -268,7 +271,7 @@ public func dmShowLauncher(_ viewController: UnsafeMutableRawPointer, _ done: @c
     guard let file = try? JSONDecoder().decode(SettingsFile.self, from: data), !file.settings.isEmpty else { fputs("[RED] launcher: dm/launcher.json cannot be read; starting the game\n", stderr); return false }
     let model = LauncherModel(file.settings)
     gameMenuModel = model   // the in-game menu shows and saves the same choices (GameMenu.swift)
-    if ProcessInfo.processInfo.environment["DM_LAUNCHER"] == "0" { fputs("launcher: off (DM_LAUNCHER=0)\n", stderr); model.applySaved(); return false }
+    if ProcessInfo.processInfo.environment["DM_LAUNCHER"] == "0" { fputs("launcher: off (DM_LAUNCHER=0)\n", stderr); model.apply(persist: false); return false }
     let parent = Unmanaged<UIViewController>.fromOpaque(viewController).takeUnretainedValue()
     var host: UIViewController?
     let view = LauncherView(m: model) {
