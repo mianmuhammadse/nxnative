@@ -24,6 +24,7 @@ namespace Ryujinx.Graphics.Shader.Translation
         private readonly SetBindingPair[] _sbSlotToBindingMap;
         private uint _sbSlotWritten;
         private uint _sbSlotBounded;   // nxnative: TranslationFlags.MetalStorageBounds
+        private int _textureQueryBinding = -1;
 
         private readonly Dictionary<int, int> _sbSlots;
         private readonly Dictionary<int, int> _sbSlotsReverse;
@@ -184,10 +185,25 @@ namespace Ryujinx.Graphics.Shader.Translation
             }
         }
 
-        // nxnative: the pool table entry a raw global memory helper chose last in this invocation (GlobalToStorage.TryGenerateRawStorageOp), one word for each helper, zero at the start
-        public int AddRawLastEntryMemory()
+        // nxnative: the pool table entry cached in private registers across a shader's raw global memory helpers (GlobalToStorage.TryGenerateRawStorageOp):
+        // {baseLo, baseHi, span, deltaLo, deltaHi} and, when the shader has any global write/atomic, the entry index for gmem_log.
+        // Zero-initialized: span == 0 sends the first access (and any 4 GiB-straddling entry) through dmsh_raw_find.
+        private int[] _rawCacheMemoryIds;
+
+        public int[] GetRawCacheMemory(bool withIndex)
         {
-            return Properties.AddLocalMemory(new MemoryDefinition($"gmem_last_{Properties.LocalMemories.Count}", AggregateType.U32, 1, zeroInit: true));
+            if (_rawCacheMemoryIds == null)
+            {
+                int count = withIndex ? 6 : 5;
+                _rawCacheMemoryIds = new int[count];
+                string[] names = ["gmem_lo", "gmem_hi", "gmem_span", "gmem_dlo", "gmem_dhi", "gmem_idx"];
+                for (int i = 0; i < count; i++)
+                {
+                    _rawCacheMemoryIds[i] = Properties.AddLocalMemory(new MemoryDefinition(names[i], AggregateType.U32, 1, zeroInit: true));
+                }
+            }
+
+            return _rawCacheMemoryIds;
         }
 
         // nxnative: words 1 to 3 of a raw vector load (GlobalToStorage.TryGenerateRawStorageOp), one for the shader: the helper writes them and the loads of those words read them
@@ -397,6 +413,18 @@ namespace Ryujinx.Graphics.Shader.Translation
 
         // nxnative: the shader's raw pointer sources (GlobalToStorage.FindPointerSite), by (storage buffer cb slot, cb word, byte offset of the pointer word); the value is the site number
         public readonly Dictionary<(int, int, int), int> PointerSites = new();
+
+        public int GetTextureQueryBinding()
+        {
+            if (_textureQueryBinding < 0)
+            {
+                SetBindingPair binding = _gpuAccessor.CreateStorageBufferBinding(0);
+                AddNewStorageBuffer(binding.SetIndex, binding.Binding, "nvn_texture_query");
+                _textureQueryBinding = binding.Binding;
+            }
+
+            return _textureQueryBinding;
+        }
 
         public bool TryGetStorageBufferBinding(int sbCbSlot, int sbCbOffset, bool write, out int binding)
         {

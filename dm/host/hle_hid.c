@@ -234,6 +234,7 @@ void hid_keys_init(void) {
 //   points over that time and lifts it (the touch screen's pans and swipes, hle_touch.c gesture_sample), "dump" logs what each guest thread waits on and the graphics wait points
 //   (crash_dump_now, as the iOS app's DM_LOG_PORT dump; scripts/regress.py asks for it before stopping a hung game), "program <n>" makes oe::ExecuteProgram(n) with no parameters (a multi-program application's way between its programs, headless), "webshot <path>" saves the offline page shown as a PNG, "#…" is ignored.
 //   Look at a screen, decide, press, look again: menus whose timing moves from run to run (loading) need no blind timed script
+__attribute__((weak)) void mtl_hdr_set_requested(int mode) { (void)mode; }   // nvn_mtl.m; host tests without graphics stay no-ops
 static void *ctl_main(void *arg) {
     const char *path = arg; long off = 0; char line[1100];
     if (getenv("DM_PREV_PROGRAM") || getenv("DM_RELAUNCH")) {   // oe::ExecuteProgram or oe::RequestToRelaunchApplication started this program in the last one's place: that program acted on what the file holds
@@ -265,7 +266,9 @@ static void *ctl_main(void *arg) {
                                                      while (*e3 == ' ') e3++; dm_ctl_memdump(a, n, e3); continue; }
                 if (!strncmp(line, "cvari ", 6)) { void dm_ctl_cvar_i32(uint64_t off, int32_t v); char *e2; uint64_t off = strtoull(line + 6, &e2, 16); dm_ctl_cvar_i32(off, (int32_t)strtol(e2, NULL, 0)); continue; }
                 if (!strncmp(line, "cvarf ", 6)) { void dm_ctl_cvar_f32(uint64_t off, float v); char *e2; uint64_t off = strtoull(line + 6, &e2, 16); dm_ctl_cvar_f32(off, strtof(e2, NULL)); continue; }
-                if (!strncmp(line, "env ", 4)) { char *eq = strchr(line + 4, '='); if (eq) { *eq = 0; setenv(line + 4, eq + 1, 1); LOG("DM_CTL: env %s=%s", line + 4, eq + 1);
+                if (!strncmp(line, "env ", 4)) { char *eq = strchr(line + 4, '='); if (eq) { *eq = 0;
+                                                     if (!strcmp(line + 4, "DM_HDR")) { int m = !strcmp(eq + 1, "1") ? 1 : !strcmp(eq + 1, "2") ? 2 : 0; mtl_hdr_set_requested(m); LOG("DM_CTL: env DM_HDR=%d", m); continue; }
+                                                     setenv(line + 4, eq + 1, 1); LOG("DM_CTL: env %s=%s", line + 4, eq + 1);
                                                      if (!strncmp(line + 4, "DM_IMU_", 7) || !strcmp(line + 4, "DM_SIX_DELAY")) { void imu_env_reread(void); imu_env_reread(); } } continue; }   // the IMU's switches are read again
                 if (!strncmp(line, "texdump ", 8)) { void dm_gfx_texdump_next(const char *path); dm_gfx_texdump_next(line + 8); LOG("DM_CTL: colour targets of the next frame → %s (as DM_NVN_TEXDUMP)", line + 8); continue; }
                 if (!strncmp(line, "passdump ", 9)) { void dm_gfx_passdump_next(long n); dm_gfx_passdump_next(atol(line + 9)); LOG("DM_CTL: passes of the next %ld frames (as DM_NVN_PASSDUMP)", atol(line + 9)); continue; }
@@ -1773,6 +1776,13 @@ HLE_FORCE("_ZN2nn3hid6detail19SendVibrationValuesEPKNS0_21VibrationDeviceHandleE
 // Mouse / keyboard: not connected
 HLE_FORCE("_ZN2nn3hid15InitializeMouseEv", "mouse; not provided by the host", void, h_hid_InitMouse, void) {}
 HLE_FORCE("_ZN2nn3hid14GetMouseStatesEPNS0_10MouseStateEi", "mouse states: 0 entries", int, h_hid_MouseStates, void *out, int n) { (void)out; (void)n; return 0; }
+// SDK 20.5.3's MouseHandle overloads dispatch the ordinary mouse (GetMouseHandle returns 0) to the same operations.
+// The debug mouse has no samples on the host either. GetMouseHandle itself makes a value without HID IPC and runs in the SDK.
+HLE_FORCE("_ZN2nn3hid15InitializeMouseERKNS0_11MouseHandleE", "mouse initialization by handle", void, h_hid_InitMouseHandle, const uint32_t *handle) {
+    (void)handle; h_hid_InitMouse();
+}
+HLE_FORCE("_ZN2nn3hid14GetMouseStatesEPNS0_10MouseStateEiRKNS0_11MouseHandleE", "mouse states by handle", int, h_hid_MouseStatesHandle,
+          void *out, int n, const uint32_t *handle) { (void)handle; return h_hid_MouseStates(out, n); }
 // Single state (13 Sentinels calls it every frame; without the hook the sdk aborts on its uninitialized mouse resource): MouseState is 0x28 bytes {sampling number i64, x, y, dx, dy, wheel dx, dy, buttons, attributes}; attributes 0 = not connected
 HLE_FORCE("_ZN2nn3hid13GetMouseStateEPNS0_10MouseStateE", "mouse state: not connected (MouseState 0x28 bytes zeroed)", void, h_hid_MouseState, void *s) {
     memset(s, 0, 0x28); ((int64_t *)s)[0] = atomic_fetch_add(&g_sampling, 1) + 1;
@@ -1925,6 +1935,23 @@ HLE_FORCE("_ZN2nn3hid17GetDebugPadStatesEPNS0_13DebugPadStateEi", "debug pad sta
 HLE_FORCE("_ZN2nn3hid20FinalizeSensorFusionEv", "end of sensor fusion (SDK 22): the host keeps no IMU state to disable", void, h_hid_FusionFin, void) {}
 HLE_FORCE("_ZN2nn3hid25EnableSixAxisSensorFusionERKNS0_19SixAxisSensorHandleEb", "six-axis sensor fusion; ignored by the host", void, h_hid_SixFusionOn, const uint32_t *h, uint32_t on) { (void)h; (void)on; }
 HLE_FORCE("_ZN2nn3hid28IsSixAxisSensorFusionEnabledERKNS0_19SixAxisSensorHandleE", "six-axis sensor fusion: off", unsigned, h_hid_SixFusionQ, const uint32_t *h) { (void)h; return 0; }
+// Unaltered six-axis passthrough (SDK 13 and later). The SDK asks the hid service (IHidServer EnableSixAxisSensorUnalteredPassthrough /
+// IsSixAxisSensorUnalteredPassthroughEnabled), which the host does not serve, and reads its null service object (Nintendo Switch Sports 1.5.0 at boot, #3378: CRASH sig=11
+// addr=0 in hid::detail::EnableSixAxisSensorPassthrough). By its name it hands the game the sensor's values without the user calibration; the host has no user calibration to
+// leave out (the rest offset it takes off a GameController's gyro stays), so its values do not change: the setting is kept per sensor (device 2's under device 0, one
+// sensor as for its calibration) and answered back
+static _Atomic unsigned char g_six_pass[SIX_NPADS][SIX_DEVICES];
+HLE_FORCE("_ZN2nn3hid30EnableSixAxisSensorPassthroughERKNS0_19SixAxisSensorHandleEb", "six-axis unaltered passthrough: kept; the host has no user calibration to leave out",
+          Result, h_hid_SixPassOn, const uint32_t *h, uint32_t on) {
+    int slot, dev; Result r = six_handle_slot("EnableSixAxisSensorPassthrough", *h, &slot, &dev);
+    if (r == RES_OK) atomic_store_explicit(&g_six_pass[slot][six_cal_dev(dev)], (unsigned char)(on & 1), memory_order_relaxed);
+    return r;
+}
+HLE_FORCE("_ZN2nn3hid33IsSixAxisSensorPassthroughEnabledERKNS0_19SixAxisSensorHandleE", "six-axis unaltered passthrough: as the game last set it",
+          unsigned, h_hid_SixPassQ, const uint32_t *h) {
+    int slot, dev; if (six_handle_slot("IsSixAxisSensorPassthroughEnabled", *h, &slot, &dev) != RES_OK) return 0;
+    return atomic_load_explicit(&g_six_pass[slot][six_cal_dev(dev)], memory_order_relaxed);
+}
 HLE_FORCE("_ZN2nn3hid25GetGyroscopeZeroDriftModeERKNS0_19SixAxisSensorHandleE", "gyroscope zero-drift mode: standard", int, h_hid_GyroGet, const uint32_t *h) { (void)h; return 1; }
 HLE_FORCE("_ZN2nn3hid25SetGyroscopeZeroDriftModeERKNS0_19SixAxisSensorHandleERKNS0_22GyroscopeZeroDriftModeE", "gyroscope zero-drift mode; ignored by the host", void, h_hid_GyroSet, const uint32_t *h, const int *m) { (void)h; (void)m; }
 HLE_FORCE("_ZN2nn3hid32GetSixAxisSensorFusionParametersEPfS1_RKNS0_19SixAxisSensorHandleE", "six-axis sensor fusion parameters: 0", void, h_hid_FusionGet, float *a, float *b, const uint32_t *h) { (void)h; *a = 0; *b = 0; }

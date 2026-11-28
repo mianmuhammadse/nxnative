@@ -265,8 +265,18 @@ typedef struct { int32_t prim, itype, count, base_vertex, base_instance, instanc
 // Games size command memory by what nvnCommandBufferGetCommandMemoryUsed reports, so a plain draw must not take more of it than the real driver's commands do. Breath of the Wild
 // records each mesh's draw into a scratch command buffer and reserves that many bytes per mesh for the model's prerecorded draws, in the heap its resource size table sizes:
 // at 0x50 bytes per recorded draw (0x30 now, with its END) three models needed one 4 KB page more than their table entry, and loading them crashed (main+0x155a7a4)
-static inline const p_draw *draw_rec(const void *a, uint32_t size, p_draw *t) { if (size - 8 >= sizeof *t) return a; memset(t, 0, sizeof *t); memcpy(t, a, size - 8); return t; }
-static inline const p_draw_idx *draw_idx_rec(const void *a, uint32_t size, p_draw_idx *t) { if (size - 8 >= sizeof *t) return a; memset(t, 0, sizeof *t); memcpy(t, a, size - 8); return t; }
+static inline const p_draw *draw_rec(const void *a, uint32_t size, p_draw *t) {
+    uint32_t n = size - 8;
+    if (n >= sizeof *t) return a;
+    if (__builtin_expect(n == offsetof(p_draw, ind), 1)) { memcpy(t, a, offsetof(p_draw, ind)); t->ind = 0; t->mdi_cnt = 0; t->mdi_i = 0; t->pad = 0; return t; }
+    memset(t, 0, sizeof *t); memcpy(t, a, n); return t;
+}
+static inline const p_draw_idx *draw_idx_rec(const void *a, uint32_t size, p_draw_idx *t) {
+    uint32_t n = size - 8;
+    if (n >= sizeof *t) return a;
+    if (__builtin_expect(n == offsetof(p_draw_idx, ind), 1)) { memcpy(t, a, offsetof(p_draw_idx, ind)); t->ind = 0; t->mdi_cnt = 0; t->mdi_i = 0; t->pad = 0; return t; }
+    memset(t, 0, sizeof *t); memcpy(t, a, n); return t;
+}
 typedef struct { int32_t x, y, z; uint64_t caller, ind; } p_dispatch;   // caller: return address of the game call site (to locate the dispatcher); ind != 0: DispatchComputeIndirect, the group counts are read by the GPU from that address
 typedef struct { const dpool_t *pool; } p_set_pool;
 typedef struct { uint64_t src; const tex_t *tex; view_t view; uint8_t has_view; NVNcopyRegion r; int32_t flags; } p_copy_b2t;
@@ -304,7 +314,7 @@ void mtl_exec(const uint8_t *handle);
 void mtl_sub_fill(uint64_t dst, uint64_t n, uint32_t value);   // in-order buffer fill within the submission (OP_CLEAR_BUF)
 void mtl_exec_rest(const uint64_t *handles, int n);   // Tells which handles in this submission still follow the current handle (used by the pass lookahead across handles)
 // Present: draw the swapchain texture to the front-end CAMetalLayer (only counts when there is no window)
-uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4], uint64_t *copy);   // Enqueue a present and return the ticket immediately; period_s: minimum time this image is displayed (= present period, 0 = unlimited); *copy: its snapshot copy (0 = none), for mtl_present_wait_texture
+uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4], int vi_hdr, uint64_t *copy);   // Enqueue a present and return the ticket immediately; period_s: minimum time this image is displayed (= present period, 0 = unlimited); vi_hdr: vi's HDR answer when the game queued the frame (mtl_hdr_vi_answer); *copy: its snapshot copy (0 = none), for mtl_present_wait_texture
 void mtl_present_wait(uint64_t ticket);                    // Wait until the present with this ticket has been processed (blit committed to the GPU queue)
 void mtl_present_wait_texture(uint64_t ticket, uint64_t copy);   // the next acquire of a presented texture, or a queue finish: with a snapshot (copy, from mtl_present) its copy has run on the GPU, else as mtl_present_wait
 int mtl_present_texture_ready(uint64_t ticket, uint64_t copy);   // non-blocking readiness check matching mtl_present_wait_texture (for nvnSyncWait with timeout 0)
@@ -399,5 +409,7 @@ void mtl_prog_forget(const prog_t *p);   // program finalize, submit lock held: 
 uint64_t nvn_new_serial(void);
 typedef void (*nvn_buffer_range_fn)(uint64_t addr, uint64_t size);
 void nvn_buffer_write_ranges(uint64_t addr, uint64_t size, nvn_buffer_range_fn note);   // Snapshot physical destinations while a copy captures its storage
+typedef int (*nvn_buffer_range_test)(uint64_t addr, uint64_t size);
+int nvn_sparse_backing_hits(const void *pool, uint64_t addr, uint64_t size, nvn_buffer_range_test hits);
 // Serials handed out from now on are above s (dm/gfx/tests/nvn_replay.m: the objects of a capture keep the live run's serials)
 void nvn_serial_floor(uint64_t s);

@@ -37,6 +37,7 @@ static void merge_rumble_to(void (*sink)(const dm_haptic_state *));
 #include "ctrl_prompt.h"
 #include "user_select_mac.h"
 #include <signal.h>
+#include <stdatomic.h>
 #include <math.h>
 #include <sys/stat.h>
 
@@ -62,6 +63,8 @@ static _Atomic int g_screen_variable_refresh;
 int front_screen_variable_refresh(void) { return g_screen_variable_refresh; }
 static CGDirectDisplayID g_match_id; static CGDisplayModeRef g_match_orig; static int g_match_orig_vrr;   // main thread: the screen this host switched, its own mode (NULL = none switched) and whether that mode is variable-refresh
 static int32_t g_match_pick; static int g_match_pick_vrr;   // main thread: the IO mode ID this host last switched to (valid while g_match_orig != NULL) and whether it is variable-refresh
+static void hdr_screen(NSScreen *screen);
+static void hdr_menu_screen(void); static void hdr_menu_log(const char *why);
 static void screen_refresh(NSScreen *screen) {   // main thread: refresh capabilities of the current screen and mode, including a mode change without moving the window
     if (!screen) return;
     g_screen_fps = (int)screen.maximumFramesPerSecond;
@@ -79,6 +82,8 @@ static void screen_refresh(NSScreen *screen) {   // main thread: refresh capabil
     } else {
         g_screen_native_fps = g_screen_fps;
     }
+    hdr_screen(screen);   // its EDR headroom (AppKit posts the screen parameters notification when the live headroom changes) and colour space
+    hdr_menu_screen();    // the HDR menu's greyed-out items follow the screen
 }
 static _Atomic int g_fullscreen;   // the window is in fullscreen (set when it has entered and when it has left)
 // Workaround for a macOS Direct-to-Display scanout artifact (GitHub issue #1821: a flickering purple/pink horizontal
@@ -143,6 +148,107 @@ static NSWindow *g_win; static _Atomic int g_match_want;   // the game's window;
 static double g_match_switched, g_match_undone;   // when this host last switched a screen, when the screens last undid a switch (CACurrentMediaTime, 0 = never)
 static int g_match_bounces, g_match_bounced;   // switches in a row due soon after an undone one; the rate is left alone until fullscreen is left or the frame rate changes
 static int g_match_recheck;   // a delayed settle check is already scheduled on the main queue
+// HDR output (front.h front_layer_hdr, front_edr_poll; nvn_mtl.m, HDR output). The layer the present asks for, applied on the main thread: SDR is the layer as made below
+// (BGRA8Unorm, no colour space, so its bytes reach the panel as they are); HDR is RGBA16Float with extended range content and no EDR metadata, in the screen's own colour space
+// extended and linear (the same colours as the SDR layer; Display P3 when the screen has none), for both HDR routes: the present writes BT.709 values for a PQ window too. The
+// screen's headroom goes to the present: maximumPotentialExtendedDynamicRangeColorComponentValue, what the screen can show, and maximumExtendedDynamicRangeColorComponentValue, what
+// it shows now (above 1.0 only once a layer wants extended range content)
+void mtl_present_edr(float potential, float live);   // nvn_mtl.h
+static _Atomic int g_hdr_want;   // the mode the present asked for (front.h): 0 SDR, 1 HDR
+static int g_hdr_mode;   // main thread: the mode the layer has
+static CGColorSpaceRef hdr_itm_space(NSScreen *screen) {   // the HDR layer's colour space: the screen's own, extended and linear; Display P3 when the screen or its space is not known (+1)
+    CGColorSpaceRef sc = screen.colorSpace.CGColorSpace, cs = sc ? CGColorSpaceCreateExtendedLinearized(sc) : NULL;
+    return cs ? cs : CGColorSpaceCreateWithName(kCGColorSpaceExtendedLinearDisplayP3);
+}
+static void hdr_screen(NSScreen *screen) {   // main thread: the screen's headroom to the present, and the HDR layer's colour space for this screen
+    if (!screen) return;
+    mtl_present_edr((float)screen.maximumPotentialExtendedDynamicRangeColorComponentValue, (float)screen.maximumExtendedDynamicRangeColorComponentValue);
+    if (!g_hdr_mode || !g_layer) return;
+    CGColorSpaceRef cs = hdr_itm_space(screen);
+    if (!g_layer.colorspace || !CFEqual(g_layer.colorspace, cs)) { g_layer.colorspace = cs; LOG("front end: HDR layer in %s", screen.colorSpace.localizedName.UTF8String ?: "Display P3"); }
+    CGColorSpaceRelease(cs);
+}
+static void hdr_apply(void) {   // main thread
+    int m = g_hdr_want;
+    if (m == g_hdr_mode || !g_layer) return;
+    g_hdr_mode = m;
+    g_layer.wantsExtendedDynamicRangeContent = m != 0;
+    g_layer.pixelFormat = m ? MTLPixelFormatRGBA16Float : MTLPixelFormatBGRA8Unorm;
+    // never an RGBA16Float layer without a colour space: without one its linear values would reach the panel as they are; the window's screen refines it below (hdr_screen)
+    CGColorSpaceRef cs = m ? hdr_itm_space(g_win.screen) : NULL;
+    g_layer.colorspace = cs; CGColorSpaceRelease(cs);   // SDR: none, as before
+    LOG("front end: %s", m ? "HDR layer (RGBA16Float, extended range, the screen's colour space linear)" : "SDR layer (BGRA8Unorm)");
+    hdr_screen(g_win.screen);   // the colour space of the window's screen, and the live headroom, which changes once the layer wants extended range content
+    hdr_menu_log("layer");
+}
+void front_layer_hdr(int mode) { if (atomic_exchange(&g_hdr_want, mode) != mode) dispatch_async(dispatch_get_main_queue(), ^{ hdr_apply(); }); }
+// The Window menu's HDR submenu: Off, BT.2446, Game's HDR (DM_HDR 0, 1, 2), the running mode ticked, and Next HDR Mode (⌃⌘H) cycling through those that can be chosen.
+// A choice calls mtl_hdr_set_requested (atomic, no runtime setenv): the present and vi read it at use, so it takes effect on the next frame. Game's HDR is greyed out for a game
+// that cannot render HDR (mtl_hdr_game_native: its modules do not import nn::vi::QueryDisplayHdrStatus), and Game's HDR asked for runs and shows as BT.2446 there. BT.2446 and
+// Game's HDR are greyed out while the window's screen has no EDR headroom: the mode stays as chosen, the present shows SDR, and moving to an EDR screen resumes it. The state
+// is worked out again when the menu opens, for a key equivalent and on every screen change (AppKit asks validateMenuItem: then). The choice is kept as the launcher's saved
+// choice launcher.DM_HDR in the app's preferences domain (docs/frontends.md, Saved choices; Off, the tested default, removes it), so the next start begins in it
+int mtl_hdr_requested(void); void mtl_hdr_set_requested(int mode); int mtl_hdr_game_native(void);   // nvn_mtl.h
+int mtl_hdr_mode_shown(int requested, int game_native); int mtl_hdr_mode_allowed(int mode, int game_native, int screen_edr); int mtl_hdr_mode_next(int shown, int game_native, int screen_edr);
+static NSString *const k_hdr_titles[3] = {@"Off", @"BT.2446", @"Game's HDR"};
+static NSMenu *g_hdr_menu;
+static int hdr_screen_edr(void) { NSScreen *s = g_win.screen; return s && s.maximumPotentialExtendedDynamicRangeColorComponentValue > 1.0; }   // main thread
+static int hdr_listed(const char *list) {   // DM_HDR in a space-separated list of names (the launcher's DM_ENV_FILE_KEYS, DM_ENV_LAUNCH_KEYS)
+    const char *k = "DM_HDR"; size_t n = strlen(k);
+    for (const char *p = list; p && (p = strstr(p, k)); p += n) if ((p == list || p[-1] == ' ') && (p[n] == ' ' || !p[n])) return 1;
+    return 0;
+}
+// the launcher's saved choice (dm/mac/launcher.c saved_choices), when the app's settings (Info.plist DMSettings) list this value of DM_HDR: the launcher ignores any other
+static void hdr_save_choice(int mode) {
+    CFBundleRef b = CFBundleGetMainBundle(); CFStringRef dom = b ? CFBundleGetIdentifier(b) : NULL; CFTypeRef values = NULL;
+    CFTypeRef rules = b ? CFBundleGetValueForInfoDictionaryKey(b, CFSTR("DMSettings")) : NULL;
+    for (CFIndex i = 0; rules && CFGetTypeID(rules) == CFArrayGetTypeID() && i < CFArrayGetCount(rules) && !values; i++) {
+        CFTypeRef r = CFArrayGetValueAtIndex(rules, i); CFTypeRef e = CFGetTypeID(r) == CFDictionaryGetTypeID() ? CFDictionaryGetValue(r, CFSTR("env")) : NULL;
+        if (e && CFGetTypeID(e) == CFStringGetTypeID() && CFStringCompare(e, CFSTR("DM_HDR"), 0) == kCFCompareEqualTo) values = CFDictionaryGetValue(r, CFSTR("values"));
+    }
+    CFStringRef v = CFStringCreateWithFormat(NULL, NULL, CFSTR("%d"), mode);
+    int listed = values && CFGetTypeID(values) == CFArrayGetTypeID() && CFArrayContainsValue(values, CFRangeMake(0, CFArrayGetCount(values)), v);
+    if (!dom || !listed) { LOG("front end: HDR %s for this run (the app's settings do not list it to keep)", k_hdr_titles[mode].UTF8String); CFRelease(v); return; }
+    CFPreferencesSetAppValue(CFSTR("launcher.DM_HDR"), mode ? v : NULL, dom); CFPreferencesAppSynchronize(dom); CFRelease(v);
+    if (hdr_listed(getenv("DM_ENV_FILE_KEYS")) || hdr_listed(getenv("DM_ENV_LAUNCH_KEYS")))
+        LOG("front end: HDR %s kept as the saved choice; the next start still takes DM_HDR from env.txt or its launch environment", k_hdr_titles[mode].UTF8String);
+    else LOG("front end: HDR %s kept as the saved choice for the next start", k_hdr_titles[mode].UTF8String);
+}
+static void hdr_menu_log(const char *why) {   // the menu's state, logged when it changes while an HDR mode is chosen (DM_HDR=0 logs nothing new)
+    if (!mtl_hdr_requested()) return;
+    static int last = -1; int nat = mtl_hdr_game_native(), edr = hdr_screen_edr(), shown = mtl_hdr_mode_shown(mtl_hdr_requested(), nat);
+    int key = shown | nat << 2 | edr << 3;
+    if (key == last) return;
+    last = key;
+    LOG("front end: HDR menu (%s): %s ticked; Game's HDR %s, the HDR modes %s", why, k_hdr_titles[shown].UTF8String, nat ? "offered" : "greyed out (the game does not import nn::vi::QueryDisplayHdrStatus)",
+        edr ? "offered (the screen has EDR headroom)" : "greyed out (the screen has no EDR headroom; the mode is kept)");
+}
+static void hdr_choose(int mode, const char *how) {
+    mtl_hdr_set_requested(mode);
+    LOG("front end: HDR %s (%s): DM_HDR=%d", k_hdr_titles[mode].UTF8String, how, mode);
+    hdr_save_choice(mode); hdr_menu_log(how); [g_hdr_menu update];
+}
+@interface DmHdrMenu : NSObject <NSMenuDelegate, NSMenuItemValidation>
+@end
+@implementation DmHdrMenu
+- (void)pick:(NSMenuItem *)item { int m = (int)item.tag; if (m != mtl_hdr_mode_shown(mtl_hdr_requested(), mtl_hdr_game_native()) || m != mtl_hdr_requested()) hdr_choose(m, "menu"); }
+- (void)cycle:(id)sender {
+    (void)sender; int nat = mtl_hdr_game_native(), edr = hdr_screen_edr(), shown = mtl_hdr_mode_shown(mtl_hdr_requested(), nat), next = mtl_hdr_mode_next(shown, nat, edr);
+    if (edr && next != shown) hdr_choose(next, "⌃⌘H");   // not on a screen without EDR: the chosen mode is kept for the next EDR screen
+}
+- (BOOL)validateMenuItem:(NSMenuItem *)item {
+    int nat = mtl_hdr_game_native(), edr = hdr_screen_edr(), shown = mtl_hdr_mode_shown(mtl_hdr_requested(), nat);
+    if (item.action == @selector(cycle:)) return edr && mtl_hdr_mode_next(shown, nat, edr) != shown;
+    item.state = item.tag == shown ? NSControlStateValueOn : NSControlStateValueOff;
+    return mtl_hdr_mode_allowed((int)item.tag, nat, edr);
+}
+- (void)menuNeedsUpdate:(NSMenu *)menu { (void)menu; hdr_menu_log("opened"); }
+@end
+static void hdr_menu_screen(void) { if (!g_hdr_menu) return; [g_hdr_menu update]; hdr_menu_log("screen"); }   // main thread: a screen change
+void front_edr_poll(void) {
+    static _Atomic int pending; if (atomic_exchange(&pending, 1)) return;
+    dispatch_async(dispatch_get_main_queue(), ^{ atomic_store(&pending, 0); hdr_screen(g_win.screen); });
+}
 static double mode_hz(CGDisplayModeRef m) { double hz = CGDisplayModeGetRefreshRate(m); return hz > 0 ? hz : 0; }   // 0 = not known (older built-in screens report none)
 static int hz_multiple(double hz, int fps) { double k = round(hz / fps); return k >= 1 && fabs(hz / fps - k) < 0.01; }   // 59.94 Hz counts as 60
 static CGError screen_set_mode(CGDirectDisplayID id, CGDisplayModeRef m) {   // for this app only (kCGConfigureForAppOnly)
@@ -321,6 +427,7 @@ static home_quit g_hq;   // the Home button's hold and quit prompt (home_quit.h)
 static int g_press_to_join;   // DM_PAD_PRESS_TO_JOIN=1, below pad_read
 static int pad_join(const void *owner, const char *name);
 static const char *pad_name(GCController *c);
+static void pad_lights(GCController *c, int p);
 static void pads_motion_changed(GCController *gone);
 // GameController's controllers that the host reads from their HID reports instead, so they stay unread here: identical pads (pad_hid_mac.h) and original Joy-Cons (pad_jc1_mac.h)
 static int pad_gc_unread(GCController *c) { return hidpad_gc_unread(c) || jc1_gc_unread(c); }
@@ -349,7 +456,7 @@ static void pad_read(GCExtendedGamepad *g) {
     #undef K
     if (p < 0) {   // DM_PAD_PRESS_TO_JOIN=1: it joins at its first button
         GCController *c = g.controller; if (!m || (p = pad_join((__bridge const void *)c, pad_name(c))) < 0) return;
-        g_held[p] = c; dm_motion_attach(c, p); pads_motion_changed(nil);
+        g_held[p] = c; pad_lights(c, p); dm_motion_attach(c, p); pads_motion_changed(nil);
     }
     if (cp_poll()) return;   // the controller applet's prompt has the controllers (front_ctrl_support)
     if (m) merge_rumble_to(NULL);   // DM_PAD_MERGE: a button on this controller takes player 1's rumble back from a Switch 2 pad or Joy-Cons read from HID
@@ -369,6 +476,11 @@ static void pad_keep_system_buttons(GCController *c) {
     c.extendedGamepad.buttonHome.pressedChangedHandler = ^(GCControllerButtonInput *b, float v, BOOL down) { (void)b; (void)v; (void)down; if (g_input_on) hq_poll(); };
 }
 static const char *pad_name(GCController *c) { return c.vendorName.UTF8String ?: "?"; }
+// Player lights of player p (pad_apple.h), and a log line when it has a player
+static void pad_lights(GCController *c, int p) {
+    if (dm_pad_lights(c, p)) LOG("controller '%s': player lights %d", pad_name(c), p + 1);
+    else if (p >= 0) LOG("controller '%s': player lights off (only players 1-4 have them)", pad_name(c));
+}
 static void npad_name(int p, char *out, size_t cap) { uint32_t id = dm_player_npad(p); if (id == 0x20) snprintf(out, cap, "handheld"); else snprintf(out, cap, "%u", id); }
 // The players' raw HID motion and Pro stick fallback follow the controllers (gone: one just removed, still listed): each model in motion_pro_mac.h counted on its own
 static int pro_gc_player(GCController *c) { return g_merge ? 0 : pad_slot_of(&g_slots, (__bridge const void *)c); }
@@ -421,11 +533,14 @@ static void pads_changed(GCController *gone) {
         for (GCController *c in GCController.controllers) if (jc1_gc_unread(c)) pad_keep_system_buttons(c);   // read from HID (pad_jc1_mac.h), a lone Joy-Con's too (no extended gamepad profile)
         for (GCController *c in GCController.controllers) if (c.extendedGamepad && c != gone) {
             if (jc1_gc_unread(c)) { c.extendedGamepad.valueChangedHandler = nil; continue; }
-            any = 1; pad_keep_system_buttons(c); c.extendedGamepad.valueChangedHandler = ^(GCExtendedGamepad *g, GCControllerElement *el) { (void)el; pad_read(g); };
+            int fresh = !c.extendedGamepad.valueChangedHandler;
+            any = 1; pad_keep_system_buttons(c);
+            if (fresh) pad_lights(c, 0);
+            c.extendedGamepad.valueChangedHandler = ^(GCExtendedGamepad *g, GCControllerElement *el) { (void)el; pad_read(g); };
             dm_motion_attach(c, 0);   // every controller is player 1: the last one moved drives its six-axis sensor
             pad_read(c.extendedGamepad);
         }
-        if (gone) dm_motion_detach(gone, 0);
+        if (gone) { if (!jc1_gc_unread(gone)) pad_lights(gone, -1); dm_motion_detach(gone, 0); }
         if (!any) { if (!g_hidpads && !g_gippads && !g_jc1_pads && !dm_switch2_pads()) dm_pad_set(0, 0, 0, 0, 0); dm_haptics_apple_controller(0, nil); }   // a raw HID pad still plays player 1 (pad_hid_mac.h)
         pads_motion_changed(gone);
         return;
@@ -436,6 +551,7 @@ static void pads_changed(GCController *gone) {
     for (int p = 0; p < DM_PLAYERS; p++) if (g_held[p] && (g_held[p] == gone || ![now containsObject:g_held[p]] || pad_gc_unread(g_held[p]))) {
         npad_name(p, nb, sizeof nb); LOG("controller '%s' disconnected: player %d (npad %s) is free", pad_name(g_held[p]), p + 1, nb);
         g_held[p].extendedGamepad.valueChangedHandler = nil;
+        if (!jc1_gc_unread(g_held[p])) pad_lights(g_held[p], -1);   // pad_jc1_mac.h drives an original Joy-Con's own lights over HID
         dm_motion_detach(g_held[p], p);
         dm_haptics_apple_controller(p, nil);
         pad_slot_free(&g_slots, (__bridge const void *)g_held[p]); g_held[p] = nil;
@@ -445,13 +561,20 @@ static void pads_changed(GCController *gone) {
         if (pad_gc_unread(c)) { pad_keep_system_buttons(c); c.extendedGamepad.valueChangedHandler = nil; continue; }   // read from IOKit; Home and Capture stay out of macOS's hands
         if (g_press_to_join) {   // a player at its first button (pad_read)
             pad_keep_system_buttons(c);
-            if (!c.extendedGamepad.valueChangedHandler) LOG("controller '%s' connected: press a button to play (DM_PAD_PRESS_TO_JOIN)", pad_name(c));
+            if (!c.extendedGamepad.valueChangedHandler) {
+                if (c.playerIndex != GCControllerPlayerIndexUnset) pad_lights(c, -1);
+                LOG("controller '%s' connected: press a button to play (DM_PAD_PRESS_TO_JOIN)", pad_name(c));
+            }
             c.extendedGamepad.valueChangedHandler = ^(GCExtendedGamepad *g, GCControllerElement *el) { (void)el; pad_read(g); };
             continue;
         }
         int p = pad_slot_take(&g_slots, (__bridge const void *)c, pad_name(c));
-        if (p < 0) { LOG("controller '%s' connected: all %d players are taken, not used", pad_name(c), DM_PLAYERS); continue; }
-        g_held[p] = c; pad_keep_system_buttons(c);
+        if (p < 0) {
+            if (c.playerIndex != GCControllerPlayerIndexUnset) pad_lights(c, -1);
+            LOG("controller '%s' connected: all %d players are taken, not used", pad_name(c), DM_PLAYERS);
+            continue;
+        }
+        g_held[p] = c; pad_keep_system_buttons(c); pad_lights(c, p);
         c.extendedGamepad.valueChangedHandler = ^(GCExtendedGamepad *g, GCControllerElement *el) { (void)el; pad_read(g); };
         dm_motion_attach(c, p);
         npad_name(p, nb, sizeof nb); LOG("controller '%s' connected: player %d (npad %s)%s", pad_name(c), p + 1, nb, c.motion.hasRotationRate ? ", with motion (gyro)" : "");
@@ -791,7 +914,7 @@ static NSView *g_cp_view; static dispatch_semaphore_t g_cp_done; static int g_cp
 static void cp_buttons(int *a, int *b) {
     *a = *b = 0;
     for (GCController *c in GCController.controllers) { GCExtendedGamepad *g = c.extendedGamepad; if (g) { *a |= g.buttonA.isPressed; *b |= g.buttonB.isPressed; } }
-    for (hid_pad *d = g_hidpads; d; d = d->next) { uint64_t m = d->twin && hidpad_is_pro(d) ? d->pro_m : pad_hid_buttons(&d->st); *a |= !!(m & DM_BTN_A); *b |= !!(m & DM_BTN_B); }
+    for (hid_pad *d = g_hidpads; d; d = d->next) { uint64_t m = hidpad_full(d) ? d->pro_m : pad_hid_buttons(&d->st); *a |= !!(m & DM_BTN_A); *b |= !!(m & DM_BTN_B); }
     for (s2_pad *d = dm_switch2_pads(); d; d = d->next) s2_pad_ab(&d->st, a, b);   // Switch 2 controllers (pad_switch2_apple.h)
     for (jc1_pad *d = g_jc1_pads; d; d = d->next) jc1_pad_ab(d, a, b);             // original Joy-Cons read from HID (pad_jc1_mac.h)
     for (gip_pad *d = g_gippads; d; d = d->next) { *a |= !!(d->st.buttons & DM_BTN_A); *b |= !!(d->st.buttons & DM_BTN_B); }   // Xbox One pads over USB (pad_gip_mac.h)
@@ -1843,6 +1966,17 @@ void front_run(void (*guest)(void)) {
             dispatch_async(dispatch_get_main_queue(), ^{ [g_cheats_menu showPanel:nil]; });
         [[bar addItemWithTitle:@"Window" action:nil keyEquivalent:@""] setSubmenu:wm];
         [wm addItemWithTitle:@"Enter Full Screen" action:@selector(toggleFullScreen:) keyEquivalent:@"f"].keyEquivalentModifierMask = NSEventModifierFlagControl | NSEventModifierFlagCommand;
+        {   // HDR (DmHdrMenu above): ⌃⌘H is free (⌘H hides the app, ⌥⌘H the others, ⌃⌘F is full screen)
+            static DmHdrMenu *hdrm; hdrm = [DmHdrMenu new];
+            NSMenu *hm = [[NSMenu alloc] initWithTitle:@"HDR"]; hm.delegate = hdrm;
+            for (int i = 0; i < 3; i++) { NSMenuItem *it = [hm addItemWithTitle:k_hdr_titles[i] action:@selector(pick:) keyEquivalent:@""]; it.tag = i; it.target = hdrm; }
+            [hm addItem:[NSMenuItem separatorItem]];
+            NSMenuItem *cy = [hm addItemWithTitle:@"Next HDR Mode" action:@selector(cycle:) keyEquivalent:@"h"];
+            cy.keyEquivalentModifierMask = NSEventModifierFlagControl | NSEventModifierFlagCommand; cy.target = hdrm;
+            [wm addItem:[NSMenuItem separatorItem]];
+            [[wm addItemWithTitle:@"HDR" action:nil keyEquivalent:@""] setSubmenu:hm];
+            g_hdr_menu = hm;
+        }
         NSMenu *controls = [[NSMenu alloc] initWithTitle:@"Controls"];
         NSMenuItem *stickMotion = [controls addItemWithTitle:@"Right Stick Motion" action:@selector(toggleStickMotion:) keyEquivalent:@"g"];
         stickMotion.target = v;

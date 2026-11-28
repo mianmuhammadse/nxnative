@@ -64,7 +64,7 @@ def mwa_on(platform, osmin):
 
 
 def host_constants(platform='ios', osmin=None):
-    return {'dm_border_off': (abi.BORDER_FC, True), 'dm_blend_off': (abi.BLEND_OFF_FC, False), 'dm_mwa3_fc': (abi.MWA_FC, mwa_on(platform, osmin))}
+    return {'dm_border_off': (abi.BORDER_FC, True), 'dm_blend_off': (abi.BLEND_OFF_FC, False), 'dm_pool_mark_off': (abi.POOL_MARK_FC, False), 'dm_mwa3_fc': (abi.MWA_FC, mwa_on(platform, osmin))}
 
 
 HOST_CONSTANTS = host_constants()
@@ -207,8 +207,13 @@ def plan(lib_dir, chain, pairs, zero):
         if vf is None or ff is None: left['library'] += 1; continue
         if ventry not in vf or fentry not in ff: left['entry'] += 1; continue
         if any(c not in HOST_CONSTANTS for c in vf[ventry] + ff[fentry]): rest.append((vk, fk)); continue   # script specializes HOST_CONSTANTS as the host does
-        b = (vl, ventry, fl, fentry)
-        if b not in seen: seen.add(b); bases.append(b)
+        entries = [fentry]
+        early = fj.get('entry_early')
+        if early in ff and all(c in HOST_CONSTANTS for c in ff[early]):
+            entries.append(early)
+        for entry in entries:
+            b = (vl, ventry, fl, entry)
+            if b not in seen: seen.add(b); bases.append(b)
     return bases, rest, left
 
 

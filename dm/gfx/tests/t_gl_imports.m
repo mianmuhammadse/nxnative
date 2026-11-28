@@ -19,6 +19,7 @@ uint64_t now_ns(void) { return clock_gettime_nsec_np(CLOCK_UPTIME_RAW); }
 uint64_t guest_ns(void) { return 0; }
 uint64_t guest_ticks(void) { return 0; }
 void guest_clock_read_wait(void) {}
+void guest_applet_wait(void) {}
 void thr_svc_enter(uint64_t *r, uint64_t a) { (void)r; (void)a; }
 void thr_svc_leave(void) {}
 void dm_spin_wait(uint64_t r, uint64_t a) { (void)r; (void)a; }
@@ -1123,6 +1124,122 @@ static void test_active_attributes(void) {
     puts("GL attribute reflection: count, maximum length, enumeration, truncation and errors: OK");
 }
 
+static void test_uniform_block_reflection(void) {
+    void (*uniformsiv)(GLuint, GLsizei, const GLuint *, GLenum, GLint *) = import("glGetActiveUniformsiv");
+    assert(uniformsiv && h_eglGetProcAddress("glGetActiveUniformsiv") == (void *)uniformsiv);
+
+    // Reject malformed member rows (out-of-range block slot or invalid row_major flag)
+    char bad_slot[] = "aaaaaaaaaaaaaaaa\tvert\tr:0:1 n:B=0:16 m:x=1:0:vec4:0:0:0:0\ttest";
+    char bad_rm[] = "bbbbbbbbbbbbbbbb\tvert\tr:0:1 n:B=0:16 m:x=0:0:mat4:0:0:16:2\ttest";
+    shinfo bad = {0};
+    assert(!sh_read_row(bad_slot, &bad));
+    assert(!sh_read_row(bad_rm, &bad));
+
+    // Vertex + fragment tables: shared block across stages (deduplicated), two distinct uninstanced blocks with a colliding
+    // bare member name (`common`), two instanced blocks (`InstA.m` / `InstB.m`), reflected matrix strides (8 and 16) and row_major
+    char vrow[] = "1111111111111111\tvert\tr:0:4 b:0:64 u:scale=0:float:0:0 u:weights=16:vec4:3:16 "
+                  "n:SharedCB=1:128 m:mtxPVW=1:0:mat4:0:0:16:0 m:rm3=1:64:mat3:0:0:16:1 "
+                  "n:VertCB=2:64 m:common=2:0:mat2:0:0:8:0 "
+                  "n:InstA=3:64 m:InstA.m=3:0:mat3x4:0:0:16:1\ttest";
+    char frow[] = "2222222222222222\tfrag\tr:0:3 "
+                  "n:SharedCB=0:128 m:mtxPVW=0:0:mat4:0:0:16:0 "
+                  "n:FragCB=1:64 m:common=1:16:vec4:2:16:0:0 "
+                  "n:InstB=2:64 m:InstB.m=2:0:mat4:0:0:16:0\ttest";
+    shinfo vsi = {0}, fsi = {0};
+    assert(sh_read_row(vrow, &vsi) && sh_read_row(frow, &fsi));
+    assert(vsi.nb == 3 && vsi.nm == 4 && fsi.nb == 3 && fsi.nm == 3);
+    vsi.nargs = fsi.nargs = 0;   // synthetic link without Metal argument encoder
+
+    GLuint pr = h_glCreateProgram(), vs = h_glCreateShader(GL_VERTEX_SHADER), fs = h_glCreateShader(GL_FRAGMENT_SHADER);
+    shader_of(vs)->si = &vsi; shader_of(vs)->fn = (id)[NSObject new];
+    shader_of(fs)->si = &fsi; shader_of(fs)->fn = (id)[NSObject new];
+    h_glAttachShader(pr, vs); h_glAttachShader(pr, fs); h_glLinkProgram(pr);
+
+    GLint val = -1;
+    h_glGetProgramiv(pr, 0x8a36 /* GL_ACTIVE_UNIFORM_BLOCKS */, &val); assert(val == 5);
+    h_glGetProgramiv(pr, 0x8a35 /* GL_ACTIVE_UNIFORM_BLOCK_MAX_NAME_LENGTH */, &val); assert(val == (GLint)sizeof "SharedCB");
+    h_glGetProgramiv(pr, GL_ACTIVE_UNIFORMS, &val); assert(val == 8);   // 2 default + 6 block members
+    h_glGetProgramiv(pr, GL_ACTIVE_UNIFORM_MAX_LENGTH, &val); assert(val == (GLint)sizeof "weights[0]");
+
+    // Default uniforms have locations; named block members never do
+    assert(h_glGetUniformLocation(pr, "scale") > 0 && h_glGetUniformLocation(pr, "weights") > 0);
+    assert(h_glGetUniformLocation(pr, "mtxPVW") == -1 && h_glGetUniformLocation(pr, "common") == -1 && h_glGetUniformLocation(pr, "InstA.m") == -1);
+
+    // Enumerate every active uniform and check glGetActiveUniform + glGetActiveUniformsiv
+    static const struct {
+        const char *name; GLenum type; GLint size, blk, off, astride, mstride, rm;
+    } want[8] = {
+        {"scale",      GL_FLOAT,        1, -1, -1, -1, -1, 0},
+        {"weights[0]", GL_FLOAT_VEC4,   3, -1, -1, -1, -1, 0},
+        {"mtxPVW",     GL_FLOAT_MAT4,   1,  0,  0,  0, 16, 0},
+        {"rm3",        GL_FLOAT_MAT3,   1,  0, 64,  0, 16, 1},
+        {"common",     GL_FLOAT_MAT2,   1,  1,  0,  0,  8, 0},
+        {"InstA.m",    GL_FLOAT_MAT3x4, 1,  2,  0,  0, 16, 1},
+        {"common[0]",  GL_FLOAT_VEC4,   2,  3, 16, 16,  0, 0},
+        {"InstB.m",    GL_FLOAT_MAT4,   1,  4,  0,  0, 16, 0},
+    };
+    GLuint idxs[8] = {0, 1, 2, 3, 4, 5, 6, 7};
+    GLint types[8], sizes[8], nlens[8], blks[8], offs[8], astrides[8], mstrides[8], rms[8];
+    uniformsiv(pr, 8, idxs, 0x8a37, types);
+    uniformsiv(pr, 8, idxs, 0x8a38, sizes);
+    uniformsiv(pr, 8, idxs, 0x8a39, nlens);
+    uniformsiv(pr, 8, idxs, 0x8a3a, blks);
+    uniformsiv(pr, 8, idxs, 0x8a3b, offs);
+    uniformsiv(pr, 8, idxs, 0x8a3c, astrides);
+    uniformsiv(pr, 8, idxs, 0x8a3d, mstrides);
+    uniformsiv(pr, 8, idxs, 0x8a3e, rms);
+    assert(h_glGetError() == GL_NO_ERROR);
+    for (int i = 0; i < 8; i++) {
+        char buf[64] = {0}; GLsizei len = -1; GLint cnt = -1; GLenum ty = 0;
+        h_glGetActiveUniform(pr, (GLuint)i, sizeof buf, &len, &cnt, &ty, buf);
+        assert(!strcmp(buf, want[i].name) && len == (GLsizei)strlen(want[i].name) && cnt == want[i].size && ty == want[i].type);
+        assert(types[i] == (GLint)want[i].type && sizes[i] == want[i].size && nlens[i] == (GLint)strlen(want[i].name) + 1);
+        assert(blks[i] == want[i].blk && offs[i] == want[i].off && astrides[i] == want[i].astride && mstrides[i] == want[i].mstride && rms[i] == want[i].rm);
+    }
+
+    // glGetActiveUniformBlockiv: name length, active uniforms/indices, stage references
+    GLint bval = -1, bindices[4] = {-1, -1, -1, -1};
+    h_glGetActiveUniformBlockiv(pr, 0, 0x8a41, &bval); assert(bval == (GLint)sizeof "SharedCB");
+    h_glGetActiveUniformBlockiv(pr, 0, 0x8a42, &bval); assert(bval == 2);
+    h_glGetActiveUniformBlockiv(pr, 0, 0x8a43, bindices); assert(bindices[0] == 2 && bindices[1] == 3);
+    h_glGetActiveUniformBlockiv(pr, 0, 0x8a44, &bval); assert(bval == 1);
+    h_glGetActiveUniformBlockiv(pr, 0, 0x8a46, &bval); assert(bval == 1);
+    h_glGetActiveUniformBlockiv(pr, 1, 0x8a44, &bval); assert(bval == 1);
+    h_glGetActiveUniformBlockiv(pr, 1, 0x8a46, &bval); assert(bval == 0);
+    h_glGetActiveUniformBlockiv(pr, 3, 0x8a42, &bval); assert(bval == 1);
+    h_glGetActiveUniformBlockiv(pr, 3, 0x8a43, bindices); assert(bindices[0] == 6);
+    h_glGetActiveUniformBlockiv(pr, 3, 0x8a44, &bval); assert(bval == 0);
+    h_glGetActiveUniformBlockiv(pr, 3, 0x8a46, &bval); assert(bval == 1);
+    assert(h_glGetError() == GL_NO_ERROR);
+
+    // Error handling: negative count, out-of-range index leaves output untouched, wrong object, invalid pname even with n == 0
+    GLint out[2] = {77, 88};
+    const GLuint bad_idx[2] = {0, 8};
+    uniformsiv(pr, -1, idxs, 0x8a3a, out); assert(h_glGetError() == GL_INVALID_VALUE);
+    uniformsiv(pr, 2, bad_idx, 0x8a3a, out); assert(h_glGetError() == GL_INVALID_VALUE && out[0] == 77 && out[1] == 88);
+    uniformsiv(vs, 1, idxs, 0x8a3a, out); assert(h_glGetError() == GL_INVALID_OPERATION);
+    uniformsiv(pr, 0, idxs, 0x1234, out); assert(h_glGetError() == GL_INVALID_ENUM);
+
+    // Failed relink clears blocks and members
+    h_glDetachShader(pr, vs); h_glLinkProgram(pr);
+    h_glGetProgramiv(pr, 0x8a36, &val); assert(val == 0);
+    h_glGetProgramiv(pr, GL_ACTIVE_UNIFORMS, &val); assert(val == 0);
+
+    // More than 8 uniform blocks link cleanly
+    char many[] = "3333333333333333\tvert\tr:0:10 n:B0=0:16 n:B1=1:16 n:B2=2:16 n:B3=3:16 n:B4=4:16 n:B5=5:16 n:B6=6:16 n:B7=7:16 n:B8=8:16 n:B9=9:16 "
+                  "m:m9=9:0:vec4:0:0:0:0\ttest";
+    shinfo msi = {0}; assert(sh_read_row(many, &msi)); msi.nargs = 0;
+    shader_of(vs)->si = &msi;
+    h_glDetachShader(pr, fs); h_glAttachShader(pr, vs); h_glLinkProgram(pr);
+    h_glGetProgramiv(pr, 0x8a36, &val); assert(val == 10);
+    GLuint idx0 = 0; GLint blk9 = -1;
+    uniformsiv(pr, 1, &idx0, 0x8a3a, &blk9); assert(blk9 == 9 && h_glGetError() == GL_NO_ERROR);
+
+    h_glDeleteProgram(pr); h_glDeleteShader(vs); h_glDeleteShader(fs);
+    sh_free(&vsi); sh_free(&fsi); sh_free(&msi);
+    puts("GL uniform block reflection: layout, collisions, glGetActiveUniformsiv and errors: OK");
+}
+
 static void test_fate_calls(void) {
     assert(import("glValidateProgram") == (void *)h_glValidateProgram_ctx && import("glLineWidth") == (void *)h_glLineWidth_ctx);
     assert(import("glClearTexImage") == (void *)h_glClearTexImage_bs);
@@ -1183,6 +1300,21 @@ static void test_argument_buffers(const char *dir) {
         assert(shader_of(shaders[st])->fn); h_glAttachShader(pr, shaders[st]);
     }
     h_glLinkProgram(pr); assert(prog_of(pr)->linked && prog_of(pr)->ae[0] && prog_of(pr)->ae[1]); h_glUseProgram(pr);
+    // Named block member reflection end-to-end through gl_shaders.py -> gl_shaders.tsv -> host
+    GLint nblk = 0, nuni = 0, fidx = -1;
+    h_glGetProgramiv(pr, 0x8a36, &nblk); assert(nblk == 1);
+    h_glGetProgramiv(pr, GL_ACTIVE_UNIFORMS, &nuni); assert(nuni >= 1);
+    for (GLint i = 0; i < nuni; i++) {
+        char nm[64]; GLsizei l = 0; GLint c = 0; GLenum t = 0;
+        h_glGetActiveUniform(pr, (GLuint)i, sizeof nm, &l, &c, &t, nm);
+        if (!strcmp(nm, "factors")) { assert(c == 1 && t == GL_FLOAT_VEC4); fidx = i; }
+    }
+    assert(fidx >= 0 && h_glGetUniformLocation(pr, "factors") == -1);
+    GLuint fu = (GLuint)fidx; GLint fblk = -1, foff = -1, fastr = -1, fmstr = -1, frow = -1;
+    h_glGetActiveUniformsiv(pr, 1, &fu, 0x8a3a, &fblk); h_glGetActiveUniformsiv(pr, 1, &fu, 0x8a3b, &foff);
+    h_glGetActiveUniformsiv(pr, 1, &fu, 0x8a3c, &fastr); h_glGetActiveUniformsiv(pr, 1, &fu, 0x8a3d, &fmstr);
+    h_glGetActiveUniformsiv(pr, 1, &fu, 0x8a3e, &frow);
+    assert(fblk == 0 && foff == 0 && fastr == 0 && fmstr == 0 && frow == 0);
     GLuint textures[17], samplers[17], vao, vb, ub, target, fb;
     h_glGenTextures(17, textures); h_glGenSamplers(17, samplers);
     for (int i = 0; i < 17; i++) {
@@ -1778,6 +1910,227 @@ static void test_swizzle_and_layout_binding(void) {
     puts("GL layout(binding) and GL_TEXTURE_SWIZZLE_RGBA GPU readback: OK");
 }
 
+// OpenGL 4.5 direct state access (issue #3420): object creation, direct operations, GL validation, and binding preservation.
+static void test_dsa(void) {
+    void (*create_bufs)(GLsizei, GLuint *) = import("glCreateBuffers");
+    void (*named_buf_data)(GLuint, GLsizeiptr, const void *, GLenum) = import("glNamedBufferData");
+    void (*create_texs)(GLenum, GLsizei, GLuint *) = import("glCreateTextures");
+    void (*tex_storage2d)(GLuint, GLsizei, GLenum, GLsizei, GLsizei) = import("glTextureStorage2D");
+    void (*tex_sub2d)(GLuint, GLint, GLint, GLint, GLsizei, GLsizei, GLenum, GLenum, const void *) = import("glTextureSubImage2D");
+    void (*comp_sub2d)(GLuint, GLint, GLint, GLint, GLsizei, GLsizei, GLenum, GLsizei, const void *) = import("glCompressedTextureSubImage2D");
+    void (*tex_parami)(GLuint, GLenum, GLint) = import("glTextureParameteri");
+    void (*tex_paramfv)(GLuint, GLenum, const GLfloat *) = import("glTextureParameterfv");
+    void (*create_fbs)(GLsizei, GLuint *) = import("glCreateFramebuffers");
+    void (*named_fb_tex)(GLuint, GLenum, GLuint, GLint) = import("glNamedFramebufferTexture");
+    GLenum (*check_named_fb)(GLuint, GLenum) = import("glCheckNamedFramebufferStatus");
+    assert(h_eglGetProcAddress("glCreateBuffers") == (void *)create_bufs);
+    assert(h_eglGetProcAddress("glNamedBufferData") == (void *)named_buf_data);
+    assert(h_eglGetProcAddress("glCreateTextures") == (void *)create_texs);
+    assert(h_eglGetProcAddress("glTextureStorage2D") == (void *)tex_storage2d);
+    assert(h_eglGetProcAddress("glTextureSubImage2D") == (void *)tex_sub2d);
+    assert(h_eglGetProcAddress("glCompressedTextureSubImage2D") == (void *)comp_sub2d);
+    assert(h_eglGetProcAddress("glTextureParameteri") == (void *)tex_parami);
+    assert(h_eglGetProcAddress("glTextureParameterfv") == (void *)tex_paramfv);
+    assert(h_eglGetProcAddress("glCreateFramebuffers") == (void *)create_fbs);
+    assert(h_eglGetProcAddress("glNamedFramebufferTexture") == (void *)named_fb_tex);
+    assert(h_eglGetProcAddress("glCheckNamedFramebufferStatus") == (void *)check_named_fb);
+    assert(h_glGetError() == GL_NO_ERROR);
+
+    // Sentinel bindings across buffers, textures (non-zero active unit), and draw/read framebuffers
+    GLuint vao = 0; h_glGenVertexArrays(1, &vao); h_glBindVertexArray(vao);
+    GLuint sb[4] = {0}; h_glGenBuffers(4, sb);
+    h_glBindBuffer(GL_ARRAY_BUFFER, sb[0]);
+    h_glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, sb[1]);
+    h_glBindBuffer(GL_UNIFORM_BUFFER, sb[2]);
+    h_glBindBuffer(GL_TEXTURE_BUFFER, sb[3]);
+    GLuint st[5] = {0}; h_glGenTextures(5, st);
+    h_glActiveTexture(GL_TEXTURE0 + 3);
+    h_glBindTexture(GL_TEXTURE_2D, st[0]);
+    h_glBindTexture(GL_TEXTURE_CUBE_MAP, st[1]);
+    h_glBindTexture(GL_TEXTURE_3D, st[2]);
+    h_glBindTexture(GL_TEXTURE_2D_ARRAY, st[3]);
+    h_glBindTexture(GL_TEXTURE_BUFFER, st[4]);
+    GLuint sfb[2] = {0}; h_glGenFramebuffers(2, sfb);
+    h_glBindFramebuffer(GL_DRAW_FRAMEBUFFER, sfb[0]);
+    h_glBindFramebuffer(GL_READ_FRAMEBUFFER, sfb[1]);
+
+    // Buffers: glCreateBuffers + glNamedBufferData
+    GLuint b = 0, gen_b = 0, imm_b = 0;
+    create_bufs(1, &b);
+    assert(b && buf_of(b) && buf_of(b)->created && h_glGetError() == GL_NO_ERROR);
+    const uint32_t bdata[4] = {0x11223344u, 0x55667788u, 0x99aabbccu, 0xddeeff00u};
+    named_buf_data(b, sizeof bdata, bdata, 0x88e8 /* GL_DYNAMIC_DRAW */);
+    assert(h_glGetError() == GL_NO_ERROR && buf_of(b)->size == sizeof bdata && !memcmp(buf_of(b)->mb.contents, bdata, sizeof bdata));
+    // Negative size leaves existing storage intact and records GL_INVALID_VALUE
+    named_buf_data(b, -4, bdata, 0x88e8);
+    assert(h_glGetError() == GL_INVALID_VALUE && buf_of(b)->size == sizeof bdata && !memcmp(buf_of(b)->mb.contents, bdata, sizeof bdata));
+    // Invalid usage enum
+    named_buf_data(b, 4, bdata, 0x1234);
+    assert(h_glGetError() == GL_INVALID_ENUM);
+    // Size 0 clears storage; NULL data zeroes storage
+    named_buf_data(b, 0, NULL, 0x88e4 /* GL_STATIC_DRAW */);
+    assert(h_glGetError() == GL_NO_ERROR && !buf_of(b)->mb && !buf_of(b)->size);
+    named_buf_data(b, 16, NULL, 0x88e0 /* GL_STREAM_DRAW */);
+    assert(h_glGetError() == GL_NO_ERROR && buf_of(b)->size == 16);
+    for (int i = 0; i < 16; i++) assert(((const uint8_t *)buf_of(b)->mb.contents)[i] == 0);
+    // Uncreated / invalid buffer names and negative count
+    create_bufs(-1, &gen_b); assert(h_glGetError() == GL_INVALID_VALUE);
+    named_buf_data(0, 16, bdata, 0x88e8); assert(h_glGetError() == GL_INVALID_OPERATION);
+    named_buf_data(999999, 16, bdata, 0x88e8); assert(h_glGetError() == GL_INVALID_OPERATION);
+    h_glGenBuffers(1, &gen_b);
+    named_buf_data(gen_b, sizeof bdata, bdata, 0x88e8); assert(h_glGetError() == GL_INVALID_OPERATION);
+    h_glBindBuffer(GL_ARRAY_BUFFER, gen_b); h_glBindBuffer(GL_ARRAY_BUFFER, sb[0]);
+    named_buf_data(gen_b, sizeof bdata, bdata, 0x88e8); assert(h_glGetError() == GL_NO_ERROR && buf_of(gen_b)->size == sizeof bdata);
+    // Immutable buffer rejects glNamedBufferData with GL_INVALID_OPERATION
+    h_glGenBuffers(1, &imm_b);
+    h_glBindBuffer(GL_ARRAY_BUFFER, imm_b); h_glBufferStorage(GL_ARRAY_BUFFER, 32, NULL, 0); h_glBindBuffer(GL_ARRAY_BUFFER, sb[0]);
+    named_buf_data(imm_b, 16, bdata, 0x88e8); assert(h_glGetError() == GL_INVALID_OPERATION && buf_of(imm_b)->size == 32);
+
+    // Textures: glCreateTextures, glTextureStorage2D, glTextureSubImage2D, glCompressedTextureSubImage2D, glTextureParameteri/fv
+    GLuint t2d = 0, tbc = 0, tcube = 0, tcube2 = 0, t3d = 0, tbuf = 0, gen_t = 0;
+    create_texs(GL_TEXTURE_2D, 1, &t2d);
+    create_texs(GL_TEXTURE_2D, 1, &tbc);
+    create_texs(GL_TEXTURE_CUBE_MAP, 1, &tcube);
+    create_texs(GL_TEXTURE_CUBE_MAP, 1, &tcube2);
+    create_texs(GL_TEXTURE_3D, 1, &t3d);
+    create_texs(GL_TEXTURE_BUFFER, 1, &tbuf);
+    assert(h_glGetError() == GL_NO_ERROR);
+    assert(tex_of(t2d)->target == GL_TEXTURE_2D && tex_of(tcube)->target == GL_TEXTURE_CUBE_MAP && tex_of(t3d)->target == GL_TEXTURE_3D && tex_of(tbuf)->target == GL_TEXTURE_BUFFER);
+
+    // Texture parameters and swizzle without touching bound textures
+    const GLfloat border[4] = {1, 0, 0, 1}, swz[4] = {GL_BLUE, GL_GREEN, GL_RED, GL_ONE};
+    tex_parami(t2d, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    tex_parami(t2d, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    tex_paramfv(t2d, GL_TEXTURE_BORDER_COLOR, border);
+    tex_paramfv(t2d, GL_TEXTURE_SWIZZLE_RGBA, swz);
+    assert(h_glGetError() == GL_NO_ERROR);
+    assert(tex_of(t2d)->sp.minf == GL_NEAREST && tex_of(t2d)->sp.ws == GL_CLAMP_TO_EDGE && tex_of(t2d)->sp.border[0] == 1 && tex_of(t2d)->swz[0] == GL_BLUE && tex_of(t2d)->swz[3] == GL_ONE);
+    assert(tex_of(st[0])->sp.minf == GL_NEAREST_MIPMAP_LINEAR && tex_of(st[0])->sp.ws == GL_REPEAT && tex_of(st[0])->swz[0] == GL_RED);
+
+    // 2D immutable storage + sub-image uploads across mip levels
+    tex_storage2d(t2d, 2, GL_RGBA8, 4, 4);
+    assert(h_glGetError() == GL_NO_ERROR && tex_of(t2d)->slevels == 2 && tex_of(t2d)->w == 4 && tex_of(t2d)->h == 4);
+    const uint8_t sub2[16] = {1, 2, 3, 255, 4, 5, 6, 255, 7, 8, 9, 255, 10, 11, 12, 255};
+    const uint8_t mip1[16] = {21, 22, 23, 255, 24, 25, 26, 255, 27, 28, 29, 255, 30, 31, 32, 255};
+    tex_sub2d(t2d, 0, 1, 1, 2, 2, GL_RGBA, GL_UNSIGNED_BYTE, sub2);
+    tex_sub2d(t2d, 1, 0, 0, 2, 2, GL_RGBA, GL_UNSIGNED_BYTE, mip1);
+    tex_sub2d(t2d, 0, 0, 0, 0, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);   // empty rect is a valid no-op
+    assert(h_glGetError() == GL_NO_ERROR && tex_of(t2d)->made && tex_of(t2d)->tex.mipmapLevelCount == 2);
+    uint8_t got[64];
+    [tex_of(t2d)->tex getBytes:got bytesPerRow:16 fromRegion:MTLRegionMake2D(0, 0, 4, 4) mipmapLevel:0];
+    assert(!memcmp(got + 1 * 16 + 4, sub2, 8) && !memcmp(got + 2 * 16 + 4, sub2 + 8, 8));
+    [tex_of(t2d)->tex getBytes:got bytesPerRow:8 fromRegion:MTLRegionMake2D(0, 0, 2, 2) mipmapLevel:1];
+    assert(!memcmp(got, mip1, sizeof mip1));
+
+    // Compressed 2D immutable storage + glCompressedTextureSubImage2D (including partial edge mip)
+    tex_storage2d(tbc, 3, GL_COMPRESSED_RGBA_BPTC_UNORM, 8, 8);
+    assert(h_glGetError() == GL_NO_ERROR);
+    uint8_t blk[16]; memset(blk, 0x6c, sizeof blk);
+    uint8_t small_blk[16]; memset(small_blk, 0x93, sizeof small_blk);
+    comp_sub2d(tbc, 0, 4, 0, 4, 4, GL_COMPRESSED_RGBA_BPTC_UNORM, sizeof blk, blk);
+    comp_sub2d(tbc, 2, 0, 0, 2, 2, GL_COMPRESSED_RGBA_BPTC_UNORM, sizeof small_blk, small_blk);
+    assert(h_glGetError() == GL_NO_ERROR && tex_of(tbc)->made && tex_of(tbc)->tex.mipmapLevelCount == 3);
+    [tex_of(tbc)->tex getBytes:got bytesPerRow:32 fromRegion:MTLRegionMake2D(0, 0, 8, 8) mipmapLevel:0];
+    assert(!memcmp(got + 16, blk, sizeof blk));
+    [tex_of(tbc)->tex getBytes:got bytesPerRow:16 fromRegion:MTLRegionMake2D(0, 0, 2, 2) mipmapLevel:2];
+    assert(!memcmp(got, small_blk, sizeof small_blk));
+
+    // Cube map storage works for square dimensions and rejects non-square
+    tex_storage2d(tcube, 2, GL_RGBA8, 4, 4);
+    assert(h_glGetError() == GL_NO_ERROR && tex_of(tcube)->slevels == 2);
+    tex_storage2d(tcube2, 1, GL_RGBA8, 4, 2);
+    assert(h_glGetError() == GL_INVALID_VALUE);
+
+    // Texture DSA validation
+    GLuint bad = 0;
+    create_texs(GL_TEXTURE_CUBE_MAP_POSITIVE_X, 1, &bad); assert(h_glGetError() == GL_INVALID_ENUM);
+    create_texs(0x1234, 1, &bad); assert(h_glGetError() == GL_INVALID_ENUM);
+    create_texs(GL_TEXTURE_2D, -1, &bad); assert(h_glGetError() == GL_INVALID_VALUE);
+    create_texs(0x84f5 /* GL_TEXTURE_RECTANGLE */, 1, &bad); assert(h_glGetError() == GL_NO_ERROR);   // host gap: RED1, no GL error
+    h_glGenTextures(1, &gen_t);
+    tex_storage2d(gen_t, 1, GL_RGBA8, 4, 4); assert(h_glGetError() == GL_INVALID_OPERATION);
+    tex_sub2d(gen_t, 0, 0, 0, 2, 2, GL_RGBA, GL_UNSIGNED_BYTE, sub2); assert(h_glGetError() == GL_INVALID_OPERATION);
+    comp_sub2d(gen_t, 0, 0, 0, 4, 4, GL_COMPRESSED_RGBA_BPTC_UNORM, sizeof blk, blk); assert(h_glGetError() == GL_INVALID_OPERATION);
+    tex_parami(gen_t, GL_TEXTURE_MIN_FILTER, GL_NEAREST); assert(h_glGetError() == GL_INVALID_OPERATION);
+    tex_paramfv(gen_t, GL_TEXTURE_BORDER_COLOR, border); assert(h_glGetError() == GL_INVALID_OPERATION);
+    tex_storage2d(t3d, 1, GL_RGBA8, 4, 4); assert(h_glGetError() == GL_INVALID_OPERATION);
+    tex_storage2d(tbuf, 1, GL_RGBA8, 4, 4); assert(h_glGetError() == GL_INVALID_OPERATION);
+    tex_storage2d(t2d, 1, GL_RGBA8, 4, 4); assert(h_glGetError() == GL_INVALID_OPERATION);   // already immutable
+    tex_storage2d(tcube2, 0, GL_RGBA8, 4, 4); assert(h_glGetError() == GL_INVALID_VALUE);
+    tex_storage2d(tcube2, 1, GL_RGBA8, 0, 4); assert(h_glGetError() == GL_INVALID_VALUE);
+    tex_storage2d(tcube2, 4, GL_RGBA8, 4, 4); assert(h_glGetError() == GL_INVALID_OPERATION);   // 4x4 has at most 3 levels
+    tex_storage2d(tcube2, 1, GL_RGBA, 4, 4); assert(h_glGetError() == GL_INVALID_ENUM);         // unsized internalformat
+    tex_sub2d(0, 0, 0, 0, 2, 2, GL_RGBA, GL_UNSIGNED_BYTE, sub2); assert(h_glGetError() == GL_INVALID_OPERATION);
+    tex_sub2d(tcube, 0, 0, 0, 2, 2, GL_RGBA, GL_UNSIGNED_BYTE, sub2); assert(h_glGetError() == GL_INVALID_OPERATION);
+    tex_sub2d(t3d, 0, 0, 0, 2, 2, GL_RGBA, GL_UNSIGNED_BYTE, sub2); assert(h_glGetError() == GL_INVALID_OPERATION);
+    tex_sub2d(tbc, 0, 0, 0, 4, 4, GL_RGBA, GL_UNSIGNED_BYTE, sub2); assert(h_glGetError() == GL_INVALID_OPERATION);   // compressed texture
+    tex_sub2d(t2d, -1, 0, 0, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, sub2); assert(h_glGetError() == GL_INVALID_VALUE);
+    tex_sub2d(t2d, 2, 0, 0, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, sub2); assert(h_glGetError() == GL_INVALID_OPERATION);
+    tex_sub2d(t2d, 0, 3, 0, 2, 1, GL_RGBA, GL_UNSIGNED_BYTE, sub2); assert(h_glGetError() == GL_INVALID_VALUE);
+    comp_sub2d(0, 0, 0, 0, 4, 4, GL_COMPRESSED_RGBA_BPTC_UNORM, sizeof blk, blk); assert(h_glGetError() == GL_INVALID_OPERATION);
+    comp_sub2d(tcube, 0, 0, 0, 4, 4, GL_COMPRESSED_RGBA_BPTC_UNORM, sizeof blk, blk); assert(h_glGetError() == GL_INVALID_OPERATION);
+    comp_sub2d(t3d, 0, 0, 0, 4, 4, GL_COMPRESSED_RGBA_BPTC_UNORM, sizeof blk, blk); assert(h_glGetError() == GL_INVALID_OPERATION);
+    comp_sub2d(tbc, 0, 0, 0, 4, 4, GL_RGBA8, 64, got); assert(h_glGetError() == GL_INVALID_ENUM);
+    comp_sub2d(tbc, 0, 0, 0, 4, 4, GL_COMPRESSED_RGBA_BPTC_UNORM, 15, blk); assert(h_glGetError() == GL_INVALID_VALUE);
+    comp_sub2d(tbc, 0, 1, 0, 4, 4, GL_COMPRESSED_RGBA_BPTC_UNORM, sizeof blk, blk); assert(h_glGetError() == GL_INVALID_OPERATION);
+    tex_parami(tbuf, GL_TEXTURE_MIN_FILTER, GL_NEAREST); assert(h_glGetError() == GL_INVALID_OPERATION);
+    tex_paramfv(tbuf, GL_TEXTURE_BORDER_COLOR, border); assert(h_glGetError() == GL_INVALID_OPERATION);
+
+    // Framebuffers: glCreateFramebuffers, glNamedFramebufferTexture, glCheckNamedFramebufferStatus
+    GLuint fb = 0, gen_fb = 0;
+    create_fbs(1, &fb);
+    assert(fb && h_glIsFramebuffer(fb) && h_glGetError() == GL_NO_ERROR);
+    named_fb_tex(fb, GL_COLOR_ATTACHMENT0, t2d, 1);
+    assert(h_glGetError() == GL_NO_ERROR && fb_of(fb)->col[0].kind == 1 && fb_of(fb)->col[0].name == t2d && fb_of(fb)->col[0].level == 1);
+    assert(check_named_fb(fb, GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE);
+    assert(check_named_fb(fb, GL_DRAW_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE);
+    assert(check_named_fb(fb, GL_READ_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE);
+    assert(check_named_fb(0, GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE);
+    assert(h_glGetError() == GL_NO_ERROR);
+    named_fb_tex(fb, GL_COLOR_ATTACHMENT0, 0, -99);   // detaching ignores level
+    assert(h_glGetError() == GL_NO_ERROR && !fb_of(fb)->col[0].kind && !fb_of(fb)->col[0].name);
+    // Framebuffer DSA validation
+    create_fbs(-1, &gen_fb); assert(h_glGetError() == GL_INVALID_VALUE);
+    h_glGenFramebuffers(1, &gen_fb);
+    assert(!h_glIsFramebuffer(gen_fb));
+    named_fb_tex(gen_fb, GL_COLOR_ATTACHMENT0, t2d, 0); assert(h_glGetError() == GL_INVALID_OPERATION);
+    assert(check_named_fb(gen_fb, GL_FRAMEBUFFER) == 0 && h_glGetError() == GL_INVALID_OPERATION);
+    named_fb_tex(0, GL_COLOR_ATTACHMENT0, t2d, 0); assert(h_glGetError() == GL_INVALID_OPERATION);
+    named_fb_tex(fb, GL_COLOR_ATTACHMENT0, 999999, 0); assert(h_glGetError() == GL_INVALID_VALUE);
+    named_fb_tex(fb, GL_COLOR_ATTACHMENT0, gen_t, 0); assert(h_glGetError() == GL_INVALID_VALUE);
+    named_fb_tex(fb, GL_COLOR_ATTACHMENT0, tbuf, 0); assert(h_glGetError() == GL_INVALID_OPERATION);
+    named_fb_tex(fb, GL_COLOR_ATTACHMENT0, t2d, -1); assert(h_glGetError() == GL_INVALID_VALUE);
+    named_fb_tex(fb, 0x1234, t2d, 0); assert(h_glGetError() == GL_INVALID_ENUM);
+    assert(check_named_fb(fb, 0x1234) == 0 && h_glGetError() == GL_INVALID_ENUM);
+    assert(check_named_fb(999999, GL_FRAMEBUFFER) == 0 && h_glGetError() == GL_INVALID_OPERATION);
+
+    // Every pre-existing context binding stayed untouched across all DSA calls
+    GLint cur = 0;
+    h_glGetIntegerv(0x8894, &cur); assert(cur == (GLint)sb[0]);
+    h_glGetIntegerv(0x8895, &cur); assert(cur == (GLint)sb[1]);
+    h_glGetIntegerv(0x8a28, &cur); assert(cur == (GLint)sb[2]);
+    assert(S.texture_buf.name == sb[3]);
+    h_glGetIntegerv(0x84e0, &cur); assert(cur == GL_TEXTURE0 + 3);
+    h_glGetIntegerv(0x8069, &cur); assert(cur == (GLint)st[0]);
+    h_glGetIntegerv(GL_TEXTURE_BINDING_CUBE_MAP, &cur); assert(cur == (GLint)st[1]);
+    h_glGetIntegerv(GL_TEXTURE_BINDING_3D, &cur); assert(cur == (GLint)st[2]);
+    h_glGetIntegerv(GL_TEXTURE_BINDING_2D_ARRAY, &cur); assert(cur == (GLint)st[3]);
+    h_glGetIntegerv(GL_TEXTURE_BINDING_BUFFER, &cur); assert(cur == (GLint)st[4]);
+    h_glGetIntegerv(GL_FRAMEBUFFER_BINDING, &cur); assert(cur == (GLint)sfb[0]);
+    h_glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &cur); assert(cur == (GLint)sfb[1]);
+    assert(h_glGetError() == GL_NO_ERROR);
+
+    // Cleanup
+    h_glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    h_glDeleteFramebuffers(2, sfb); h_glDeleteFramebuffers(1, &fb); h_glDeleteFramebuffers(1, &gen_fb);
+    h_glDeleteTextures(5, st); h_glDeleteTextures(1, &t2d); h_glDeleteTextures(1, &tbc); h_glDeleteTextures(1, &tcube);
+    h_glDeleteTextures(1, &tcube2); h_glDeleteTextures(1, &t3d); h_glDeleteTextures(1, &tbuf); h_glDeleteTextures(1, &gen_t);
+    h_glActiveTexture(GL_TEXTURE0);
+    h_glDeleteBuffers(4, sb); h_glDeleteBuffers(1, &b); h_glDeleteBuffers(1, &gen_b); h_glDeleteBuffers(1, &imm_b);
+    h_glBindVertexArray(0); h_glDeleteVertexArrays(1, &vao);
+    puts("GL 4.5 direct state access: OK");
+}
+
 int main(int argc, char **argv) {
     if (argc == 2 && !strcmp(argv[1], "--srgb")) return test_framebuffer_srgb();
     if (argc == 2 && !strcmp(argv[1], "--capture")) return test_capture_shaders();
@@ -1912,6 +2265,7 @@ int main(int argc, char **argv) {
     if (!cpu) test_literal_stride_fetch();
     test_uniform_buffer();
     test_compressed_arrays();
+    test_dsa();
     test_doom3();
     test_packed_uploads();
     if (!cpu && test_framebuffer_srgb()) return 1;
@@ -1924,6 +2278,7 @@ int main(int argc, char **argv) {
     if (!cpu) { test_shared_contexts(); test_nvn_interop(); }
     test_program_validation();
     test_active_attributes();
+    test_uniform_block_reflection();
     test_fate_calls();
     test_fixed_function(!cpu);
     if (!cpu) {

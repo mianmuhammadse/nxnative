@@ -41,7 +41,7 @@ function-matched `AddressRegionManager` cut (`rewrite_sdk.log`).
 
 ## Shaders
 
-16,971 in [`shader_map.tsv`](shader_map.tsv): 11,417 pixel, 5,518 vertex, 33 compute, 3 geometry;
+16,971 in `shader_map.tsv`: 11,417 pixel, 5,518 vertex, 33 compute, 3 geometry;
 by source 8,933 map, 4,332 character, 2,826 `monolib`, 874 effect and 6 from `main`. All of them
 translate; a Mac build takes 1 min 33 s on the M6. The split leaves out 6 control sections in
 `main` (`@0xa0e928` to `@0xa0ed38`, 0xd0 apart) with no code area it can find; none was asked
@@ -73,6 +73,8 @@ dropped, 268 discarded), while the battle showed none dropped. Not looked into.
   two-image swapchain CPU-GPU race on alternating per-frame constants caused flat-colour frames and NaN exposure.
 - [MetalFX temporal scaler async initialization aborts and dynamic-resolution texture switches](../../../docs/reference/rendering.md#metalfx-temporal-scaler-async-initialization-aborts-and-dynamic-resolution-texture-switches):
   synchronous scaler init avoids the M2 Pro async ANE swap abort and descriptor-keyed caching removes ~88 ms dynamic-resolution stalls.
+- [An upscaler's colour read from its code](../../../docs/reference/rendering.md#an-upscalers-colour-read-from-its-code):
+  `f809de4b7aab2c96` (no-curve NDSR variant, `RGBA8Unorm` → `RGBA8Unorm`, 1920x1080 → 3840x2160 docked) drawn by MetalFX as `UP_COLOR_SAME` ([PR #3399](https://github.com/seedds/nxnative/pull/3399), M2 Pro: GPU 24 → 14.2 ms, 25 → 16.62 ms locked 60 fps).
 
 ## Open
 

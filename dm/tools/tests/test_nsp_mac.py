@@ -308,9 +308,9 @@ class Nvn(Base):
 
     def test_the_iphone_image_leaves_out_what_its_app_does_not_read(self):
         real = nsp.shader_lib.pack
-        def with_pulling(lib, say=print, leave_out=False):   # the stand-in build makes no pulling library: one in the folder, as dmsh_build.py's
+        def with_pulling(lib, say=print, leave_out=False, on_progress=None):   # the stand-in build makes no pulling library: one in the folder, as dmsh_build.py's
             if Path(lib).is_dir(): (Path(lib) / 'k_bp.metallib').write_bytes(b'pull')
-            return real(lib, say, leave_out)
+            return real(lib, say, leave_out, on_progress=on_progress)
         ios = self.sh / 'ios' / f'b-{CHAIN}'
         with mock.patch.object(nsp.shader_lib, 'pack', with_pulling):
             self.build_ios(False)
@@ -385,7 +385,7 @@ class Nvn(Base):
     def cas(self, *names, when=0):   # cache entries with a source and a library, last changed at when
         s = self.store()
         for n in names:
-            s.put(f'shader/{n}/mac/k_b.metal', b'm' * 100 + n.encode()[:0], when); s.put(f'shader/{n}/mac/k_b.metallib', b'l' * 1000, when)
+            s.put(f'shader/{n}/mac/k_b.metal', bytes(range(100)), when); s.put(f'shader/{n}/mac/k_b.metallib', b'l' * 1000, when)
         s.close()
 
     def test_prune_shader_cache(self):   # entries the build did not list go once it succeeded; a listed one, one newer than the list and other names stay; only the sources count
